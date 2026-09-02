@@ -151,6 +151,22 @@ def find_existing_request(*, media_type: str, identity_source: str | None,
     return None
 
 
+def reused_request_message(row, label: str) -> str:
+    """Honest user-facing explanation for an identity dedupe hit.
+
+    Active work used to be reported as "already in your library" because the
+    intake API returned only a reused boolean. The row's durable status tells
+    us whether this is actually owned or merely already queued/in progress.
+    """
+    if row is None:
+        return f"{label} already has an existing request; no duplicate queued."
+    if row.status == queue_store.STATUS_FULFILLED:
+        return f"{label} is already in your library."
+    status = str(row.status or "existing").replace("_", " ")
+    return (f"{label} already has request #{row.request_id} ({status}); "
+            "no duplicate was queued.")
+
+
 # ---------------------------------------------------------------------------
 # Adding rows
 # ---------------------------------------------------------------------------

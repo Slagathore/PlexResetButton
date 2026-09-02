@@ -133,7 +133,12 @@ class GrabQueueTab:
                         row.display_title, row.state, row.reason or "",
                         (local_ts(row.next_attempt_at)
                          if row.next_attempt_at else "")))
-        self._status_var.set(f"{len(self._rows)} row(s).")
+        request_ids = {row.request_id for row in self._rows
+                       if row.request_id is not None}
+        operational = len(self._rows) - len(request_ids)
+        self._status_var.set(
+            f"{len(self._rows)} rows: {len(request_ids)} outstanding request(s)"
+            f" + {operational} download/automation/blocklist row(s).")
 
     def _selected_row(self) -> grab_queue.GrabQueueRow | None:
         sel = self._tree.selection()

@@ -356,6 +356,25 @@ def _auto_grab_query(req, *, season: int | None = None) -> str:
     return alias
 
 
+def _search_title_variants(title: str) -> tuple[str, ...]:
+    """Provider-query spellings for a canonical/alias title.
+
+    Indexers are inconsistent about ampersands: some tokenize ``&`` as the
+    word ``and`` while others retain it.  Search both spellings, preserving the
+    stored request alias (including country disambiguation) in either form.
+    """
+    clean = str(title or "").strip()
+    if not clean:
+        return tuple()
+    variants = [clean]
+    if "&" in clean:
+        worded = re.sub(r"\s*&\s*", " and ", clean)
+        worded = " ".join(worded.split())
+        if worded.casefold() != clean.casefold():
+            variants.append(worded)
+    return tuple(variants)
+
+
 def _request_identity_key(req) -> str:
     """Durable per-pass dedupe key for a request. Qualified rows key on the
     provider identity + season (so two rows resolved to the same tmdb id collapse
@@ -1006,21 +1025,38 @@ class DownloadManager:
                         "previous session.", killed)
 
         requeued = 0
+        reconciled = 0
         finish_moves: list[int] = []
-        for row in downloads_store.list_downloads(limit=300):
+        recovery_rows = downloads_store.list_downloads_by_status(
+            ("downloading", "queued", "downloaded"))
+        for row in recovery_rows:
             if row.status == "downloading":
                 downloads_store.set_status(row.download_id, "queued")
                 downloads_store.add_history(
                     row.download_id, "recovered", before=None,
                     after="app restarted — requeued (existing data is kept)")
                 requeued += 1
-            elif row.status == "downloaded" and (row.auto_move or row.auto_rename):
+            elif row.status == "downloaded" and self._reconcile_prior_move(row):
+                # Old runners could emit a duplicate late `done` event after
+                # post-processing had already moved the payload.  That event
+                # overwrote `moved` with `downloaded`; the exact audit path is
+                # stronger evidence than the now-empty staging path.
+                reconciled += 1
+            elif (row.status == "downloaded" and not row.error
+                  and row.files_json and (row.auto_move or row.auto_rename)):
                 # Post-process was interrupted (a cross-drive move can leave
-                # a PARTIAL copy at the destination) — finish it now.
+                # a PARTIAL copy at the destination) — finish it now. Legacy
+                # rows without an exact engine file manifest are deliberately
+                # left for manual review; rows already carrying an actionable
+                # import/placement error also stay manual instead of repeating
+                # the same failed operation on every launch.
                 finish_moves.append(row.download_id)
         if requeued:
             logger.info("Recovery: requeued %d download(s) from the previous "
                         "session.", requeued)
+        if reconciled:
+            logger.info("Recovery: reconciled %d download(s) whose exact prior "
+                        "move still exists.", reconciled)
         if finish_moves:
             def finisher() -> None:
                 for did in finish_moves:
@@ -1050,8 +1086,7 @@ class DownloadManager:
         if budget <= 0:
             return
         queued = sorted(
-            (r for r in downloads_store.list_downloads(limit=300)
-             if r.status == "queued"),
+            downloads_store.list_downloads_by_status(("queued",)),
             # Recently-rotated slowpokes go to the back of the line.
             key=lambda r: (self._rotate_cooldown.get(r.download_id, 0), r.download_id),
         )
@@ -1094,26 +1129,30 @@ class DownloadManager:
         sleep loop so the stall/rotate decision is unit-testable."""
         if config.QBITTORRENT_ENABLED:
             return
-        rows = downloads_store.list_downloads(limit=300)
+        rows = downloads_store.list_downloads_by_status(
+            ("queued", "downloading"))
         queued_waiting = any(r.status == "queued" for r in rows)
         now = time.time()
+        live_ids = {r.download_id for r in rows}
+        # Terminal rows no longer appear in the active query. Clear only their
+        # in-memory state; queued rows must retain rotation count/cooldown while
+        # they wait, otherwise every monitor tick resets the retry budget.
+        for download_id in set(self._progress_seen) - live_ids:
+            self._progress_seen.pop(download_id, None)
+        for download_id in set(self._rotation_count) - live_ids:
+            self._rotation_count.pop(download_id, None)
+        for download_id in set(self._rotate_cooldown) - live_ids:
+            self._rotate_cooldown.pop(download_id, None)
         for row in rows:
-            if row.status != "downloading":
+            if row.status == "queued":
                 self._progress_seen.pop(row.download_id, None)
-                self._rotation_count.pop(row.download_id, None)
-                # Release audit: _rotate_cooldown was set on every rotation
-                # (below) but only ever popped on the stall-to-error branch —
-                # a row that rotates once and then succeeds/errors/cancels on
-                # its next attempt leaked its entry here forever. Same
-                # lifecycle as the two pops above: once the row is no longer
-                # 'downloading', the cooldown bookkeeping for it is done.
-                self._rotate_cooldown.pop(row.download_id, None)
                 continue
             seen = self._progress_seen.get(row.download_id)
             if seen is None or seen[0] != row.progress:
                 # Real progress since last look — reset the stall bookkeeping.
                 self._progress_seen[row.download_id] = (row.progress, now)
                 self._rotation_count.pop(row.download_id, None)
+                self._rotate_cooldown.pop(row.download_id, None)
                 continue
             stale_s = now - seen[1]
             # Never rotate before the Node runner's own stall timeout could have
@@ -1322,7 +1361,7 @@ class DownloadManager:
         if row.status not in ("downloaded",):
             return f"Can't apply route while status is '{row.status}'."
         request_title = _request_title_from_row(row)
-        return self._post_process(
+        return self._finish_post_process(
             row.download_id, force_move=True, force_rename=True,
             request_title=request_title,
         )
@@ -1351,13 +1390,56 @@ class DownloadManager:
         # note: deferred - the oversize deferral records its reason but not
         # candidate_stats/selection_run_id (the run row does not exist yet at
         # gate time); the blocked-candidate deferral path carries both.
-        if downloads_store.check_grab_deferral(
-                key, reason="oversize: every result is >120% of the preferred size"):
+        if not DownloadManager._defer_for_retry(
+                key, hours=24.0,
+                reason="oversize: every result is >120% of the preferred size"):
             logger.info("Oversize deferral expired for %s — proceeding.", key)
             return True
         logger.info("Only oversized results for %s (>120%% of preference) — "
                     "waiting a day before taking one.", key)
         return False
+
+    @staticmethod
+    def _deferral_active(key: str) -> bool:
+        """True when a prior decision says this key is not due to search yet."""
+        detail = downloads_store.get_grab_deferral(key)
+        if detail is None:
+            return False
+        if downloads_store.deferral_expired(detail):
+            downloads_store.clear_grab_deferral(key)
+            return False
+        logger.info("%s is deferred until %s (%s) — skipping provider search.",
+                    key, detail.get("next_attempt_at"), detail.get("reason"))
+        return True
+
+    @staticmethod
+    def _defer_for_retry(key: str, *, hours: float, reason: str,
+                         candidate_stats: dict | None = None,
+                         selection_run_id: int | None = None) -> bool:
+        """Record a retry hold and move linked requests out of the open scan.
+
+        Returns True while held, False when an existing hold has expired and
+        the caller should proceed immediately.
+        """
+        ready = downloads_store.check_grab_deferral(
+            key, wait_hours=hours, reason=reason,
+            candidate_stats=candidate_stats,
+            selection_run_id=selection_run_id)
+        if ready:
+            downloads_store.clear_grab_deferral(key)
+            return False
+        if key.startswith("req:"):
+            try:
+                request_id = int(key.removeprefix("req:"))
+            except ValueError:
+                request_id = None
+            if request_id is not None:
+                req = get_request(request_id)
+                if req is not None and req.status in (
+                        queue_store.STATUS_OPEN, queue_store.STATUS_GRABBING):
+                    queue_store.set_status(
+                        request_id, queue_store.STATUS_DEFERRED)
+        return True
 
     # -- Grab-safety guards -------------------------------------------------
     # Root cause of the "kanji renames" incident: a search could return
@@ -1797,7 +1879,7 @@ class DownloadManager:
 
         Injects cam_check=video_quality.is_cam_release at EVERY site (binding
         Phase 0/1 obligation: RTN.trash alone misses HDCAM-style names like
-        WORKPRINT), the recent-failure penalty, and the (stub) blocklist input.
+        WORKPRINT), the recent-failure cooldown, and the scoped blocklist input.
         """
         from video_quality import is_cam_release
         candidates = []
@@ -1807,13 +1889,22 @@ class DownloadManager:
             candidates.append(cand)
             if cand.norm_infohash:
                 by_hash.setdefault(cand.norm_infohash, r)
-        recent = self._recent_failure_hashes(failure_key) if failure_key else None
+        recent = self._recent_failure_hashes(failure_key) if failure_key else set()
+        stats = dict(pool_stats or {})
+        if recent:
+            fresh = [candidate for candidate in candidates
+                     if candidate.norm_infohash not in recent]
+            stats["recent_failures_skipped"] = len(candidates) - len(fresh)
+            # A failed release gets a real seven-day cooldown. The former -25
+            # score alone still chose it whenever it was the only candidate,
+            # producing five identical stalls before the request cap fired.
+            candidates = fresh
         decision = torrent_select.select_torrent(
             candidates, want,
             blocklist=self._blocklist_for(want),
             recent_failures=recent,
             cam_check=is_cam_release,
-            pool_stats=pool_stats,
+            pool_stats=stats,
         )
         return decision, by_hash
 
@@ -1942,7 +2033,8 @@ class DownloadManager:
     def _grab_season_pack(self, title: str, media_type: str, season: int,
                           ep_count: int, *, request_id: int | None,
                           show: shows_store.TrackedShow | None = None,
-                          search_title: str | None = None) -> list[int]:
+                          search_title: str | None = None,
+                          defer_request_on_miss: bool = True) -> list[int]:
         """Search and grab one season as a pack (max-size cap scaled to the
         season's episode count so packs aren't vetoed by per-episode caps).
 
@@ -1954,9 +2046,37 @@ class DownloadManager:
         """
         if not search_title:
             search_title = self._search_title_for(show) if show is not None else title
+        # Provider identity, not a fuzzy/display title, owns the pack cooldown.
+        # Same-title country editions (or two unrelated shows sharing a title)
+        # must never suppress each other's season search.
+        pack_subject = (
+            f"{show.source}:{show.external_id}"
+            if show is not None and show.source and show.external_id
+            else media_identity.normalize_title(title)
+        )
+        # Request-linked attempts also carry the durable request id.  A later
+        # request for the same show/season (after the first was completed or
+        # cancelled) deserves a fresh pack attempt, while repeated passes for
+        # one live request still share one cooldown.
+        request_part = (f":req:{request_id}" if request_id is not None else "")
+        failure_key = f"pack:{pack_subject}:s{season}{request_part}"
+        # An explicit season request can fall back to individual episodes.  In
+        # that path a failed pack search must cool down only the PACK attempt;
+        # a request-wide hold would make every SxxExx fallback immediately skip.
+        deferral_key = (f"req:{request_id}"
+                        if request_id is not None and defer_request_on_miss
+                        else failure_key)
+        if self._deferral_active(deferral_key):
+            return []
         results: list[TorrentResult] = []
         pool_stats: dict = {}
-        for query in (f"{search_title} S{season:02d}", f"{search_title} Season {season}"):
+        queries = tuple(
+            query
+            for variant in _search_title_variants(search_title)
+            for query in (f"{variant} S{season:02d}",
+                          f"{variant} Season {season}")
+        )
+        for query in queries:
             try:
                 pool = search_collect(query, media_type)
             except Exception:
@@ -1965,7 +2085,9 @@ class DownloadManager:
             if pool.results:
                 results = list(pool.results)
                 pool_stats = dict(pool.pool_stats)
+                pool_stats["matched_query"] = query
                 break
+        pool_stats.setdefault("queries_tried", list(queries))
         # Pre-filter to plausible packs (seeders required — packs never race) and
         # guard against unrelated shows before the engine scores what survives.
         viable = [r for r in results if r.size_bytes > 0 and r.seeders > 0]
@@ -1982,8 +2104,6 @@ class DownloadManager:
         _pref, _max_rate, default_minutes = _size_prefs(media_type)
         per_ep = _runtime_minutes(show) or default_minutes
         season_minutes = max(1, ep_count) * per_ep
-        key = f"pack:{title.casefold()}:{season}"
-
         # The size max cap scales to the whole season (season_minutes), so a
         # pack isn't vetoed by a per-episode cap — passed to the engine via the
         # want's runtime_minutes override.
@@ -2000,7 +2120,7 @@ class DownloadManager:
         size_pick = self._size_pick_for_show(show)
         pref_override = size_pick.mb_per_min if (size_pick and size_pick.ok) else None
         decision, by_hash = self._run_selection(
-            viable, want, failure_key=key, pool_stats=pool_stats)
+            viable, want, failure_key=failure_key, pool_stats=pool_stats)
         chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
         if chosen is None:
             run_id = downloads_store.record_selection_run(
@@ -2008,15 +2128,24 @@ class DownloadManager:
             if self._dead_swarm(decision):
                 # Packs never race; record a deferral so the grab queue shows
                 # why it is held instead of hammering every pass.
-                downloads_store.check_grab_deferral(
-                    key, wait_hours=config.ZERO_SEEDER_DEFER_HOURS,
+                self._defer_for_retry(
+                    deferral_key, hours=config.ZERO_SEEDER_DEFER_HOURS,
                     reason="no seeded season pack available",
+                    candidate_stats=decision.verdict_histogram(),
+                    selection_run_id=run_id)
+            else:
+                skipped = decision.pool_stats.get("recent_failures_skipped", 0)
+                reason = ("all matching season packs recently failed"
+                          if skipped else "no acceptable season pack found")
+                self._defer_for_retry(
+                    deferral_key, hours=config.NO_RESULT_DEFER_HOURS,
+                    reason=reason,
                     candidate_stats=decision.verdict_histogram(),
                     selection_run_id=run_id)
             return []
         survivors = [by_hash[s.infohash] for s in decision.scores
                      if s.infohash in by_hash]
-        if not self._oversize_gate(survivors, media_type, key,
+        if not self._oversize_gate(survivors, media_type, deferral_key,
                                    minutes=season_minutes,
                                    pref_override=pref_override):
             downloads_store.record_selection_run(decision, request_id=request_id)
@@ -2027,7 +2156,8 @@ class DownloadManager:
         season_context = (show.show_id, season) if show is not None else None
         download_id = self.grab(chosen, request_id=request_id, request_title=title,
                                 auto_rename=True, auto_move=True,
-                                failure_key=key, season_context=season_context,
+                                failure_key=failure_key,
+                                season_context=season_context,
                                 quality_label=self._quality_label_for(decision, chosen))
         downloads_store.record_selection_run(
             decision, request_id=request_id, download_id=download_id)
@@ -2060,14 +2190,100 @@ class DownloadManager:
         req_season = getattr(req, "season", None)
         if req_season is not None:
             display = show.title if show is not None else title
-            ep_count = 0
+            season = int(req_season)
+            season_eps: list[shows_store.EpisodeRow] = []
             if show is not None:
-                ep_count = sum(1 for e in shows_store.list_episodes(show.show_id)
-                               if e.season == req_season)
-            return self._grab_season_pack(
-                display, req.media_type, int(req_season),
-                ep_count or 12, request_id=req.request_id, show=show,
-                search_title=title)
+                season_eps = [e for e in shows_store.list_episodes(show.show_id)
+                              if e.season == season]
+                # Intake upserts the identity-backed tracked show, but until
+                # now it never populated that show's episode grid.  A season
+                # pack miss therefore had nothing to fall back TO.  Populate
+                # the authoritative TVDB/TMDB grid on first use.
+                if not season_eps:
+                    try:
+                        show_tracker.sync_show(show.show_id)
+                    except show_tracker.ShowsBusyError:
+                        # The scheduled missing-episode pass or a manual Shows
+                        # action already owns the episode-grid lock.  This is
+                        # contention, not a provider failure: leave the request
+                        # eligible for the next five-minute pass instead of
+                        # poisoning it with a six-hour no-metadata deferral.
+                        logger.info(
+                            "Episode-grid sync busy for request #%s (%s, season "
+                            "%s); retrying on the next auto-grab pass.",
+                            req.request_id, display, season)
+                        return []
+                    except Exception:
+                        logger.exception(
+                            "Could not sync episode grid for request #%s (%s, "
+                            "season %s).", req.request_id, display, season)
+                    show = shows_store.get_show(show.show_id) or show
+                    season_eps = [
+                        e for e in shows_store.list_episodes(show.show_id)
+                        if e.season == season]
+
+            from datetime import date
+            today = date.today().isoformat()
+            aired = [e for e in season_eps
+                     if e.air_date and e.air_date <= today]
+
+            # Exact season completeness, not the broad "the show exists"
+            # library flag, is the terminal condition for a season request.
+            if aired and all(e.has_file for e in aired):
+                queue_store.update_library_status(req.request_id, found=True)
+                queue_store.complete_request(req.request_id)
+                return []
+
+            # Prefer one pack only while the requested season has no partial
+            # progress.  Once any episode exists/is linked, a later pack would
+            # duplicate work already completed or in flight.
+            has_progress = any(e.has_file or e.grab_download_id is not None
+                               for e in aired)
+            if not has_progress:
+                packed = self._grab_season_pack(
+                    display, req.media_type, season,
+                    len(aired) or len(season_eps) or 12,
+                    request_id=req.request_id, show=show,
+                    search_title=title, defer_request_on_miss=False)
+                if packed:
+                    return packed
+
+            if show is None or not aired:
+                self._defer_for_retry(
+                    f"req:{req.request_id}",
+                    hours=config.NO_RESULT_DEFER_HOURS,
+                    reason=("could not load the requested season's aired "
+                            "episode list after the season-pack search"))
+                return []
+
+            # The pack is an optimisation, never a requirement: enumerate the
+            # requested season and independently search every aired, missing
+            # episode.  Each episode owns its own retry cooldown so E01 having
+            # no release cannot poison E02..E13.
+            started: list[int] = []
+            for ep in aired:
+                if ep.has_file:
+                    continue
+                started.extend(self._grab_one_episode(
+                    show, ep, request_id=req.request_id,
+                    search_title=title))
+
+            if not started:
+                linked_live = False
+                for ep in aired:
+                    if ep.grab_download_id is None:
+                        continue
+                    linked = downloads_store.get_download(ep.grab_download_id)
+                    if linked is not None and linked.status not in (
+                            "error", "cancelled", "moved"):
+                        linked_live = True
+                        break
+                if not linked_live:
+                    self._defer_for_retry(
+                        f"req:{req.request_id}",
+                        hours=config.NO_RESULT_DEFER_HOURS,
+                        reason="no acceptable season pack or episode releases found")
+            return started
 
         if show is None or show.have_count == 0:
             display = show.title if show is not None else title
@@ -2108,7 +2324,8 @@ class DownloadManager:
 
     def _grab_one_episode(self, show: shows_store.TrackedShow,
                           ep: shows_store.EpisodeRow,
-                          *, request_id: int | None = None) -> list[int]:
+                          *, request_id: int | None = None,
+                          search_title: str | None = None) -> list[int]:
         """Search + grab a single tracked episode (shared by the missing-
         episode pass, follow-new/keep-at-100, and season-aware requests).
 
@@ -2121,20 +2338,39 @@ class DownloadManager:
             linked = downloads_store.get_download(ep.grab_download_id)
             if linked is not None and linked.status not in ("error", "cancelled"):
                 return []
-        search_title = self._search_title_for(show)
-        query = f"{search_title} S{ep.season:02d}E{ep.episode:02d}"
-        try:
-            pool = search_collect(query, show.media_type)
-            results = list(pool.results)
-            pool_stats = dict(pool.pool_stats)
-            if not results and show.media_type in ("anime", "xanime"):
-                pool = search_collect(
-                    f"{search_title} {ep.episode:02d}", show.media_type)
+        key = f"ep:{show.show_id}:{ep.season}:{ep.episode}"
+        # Episode cooldowns must stay episode-scoped even when several episode
+        # downloads link back to one season request.  A request-scoped hold on
+        # E01 used to suppress every later episode in the season.
+        deferral_key = key
+        if self._deferral_active(deferral_key):
+            return []
+        search_title = search_title or self._search_title_for(show)
+        queries = [
+            f"{variant} S{ep.season:02d}E{ep.episode:02d}"
+            for variant in _search_title_variants(search_title)
+        ]
+        if show.media_type in ("anime", "xanime"):
+            queries.extend(
+                f"{variant} {ep.episode:02d}"
+                for variant in _search_title_variants(search_title))
+        query = queries[0] if queries else (
+            f"{show.title} S{ep.season:02d}E{ep.episode:02d}")
+        results: list[TorrentResult] = []
+        pool_stats: dict = {"queries_tried": list(queries)}
+        for candidate_query in queries:
+            try:
+                pool = search_collect(candidate_query, show.media_type)
+            except Exception:
+                logger.exception("Episode search failed for %s", candidate_query)
+                continue
+            if pool.results:
+                query = candidate_query
                 results = list(pool.results)
                 pool_stats = dict(pool.pool_stats)
-        except Exception:
-            logger.exception("Episode search failed for %s", query)
-            return []
+                pool_stats["matched_query"] = candidate_query
+                pool_stats["queries_tried"] = list(queries)
+                break
         minutes = _runtime_minutes(show)
         # Episode/season contradiction + show-name guard (the engine's title
         # gate does not check episode numbers, and _result_matches_show carries
@@ -2150,7 +2386,6 @@ class DownloadManager:
         if size_pick is not None:
             pool_stats["size_match"] = size_pick.meta()
         pref_override = size_pick.mb_per_min if (size_pick and size_pick.ok) else None
-        key = f"ep:{show.show_id}:{ep.season}:{ep.episode}"
         decision, by_hash = self._run_selection(
             viable, want, failure_key=key, pool_stats=pool_stats)
         chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
@@ -2161,10 +2396,17 @@ class DownloadManager:
                 # Every gate-clean release for this episode is unseeded — race it
                 # only when explicitly enabled, else defer/recheck.
                 return self._race_or_defer(
-                    key, viable, show.media_type, minutes=minutes,
+                    deferral_key, viable, show.media_type, minutes=minutes,
                     request_id=request_id,
                     episode_context=(show.show_id, ep.season, ep.episode),
                     run_id=run_id, candidate_stats=decision.verdict_histogram())
+            skipped = decision.pool_stats.get("recent_failures_skipped", 0)
+            self._defer_for_retry(
+                deferral_key, hours=config.NO_RESULT_DEFER_HOURS,
+                reason=("all matching releases recently failed"
+                        if skipped else "no acceptable episode release found"),
+                candidate_stats=decision.verdict_histogram(),
+                selection_run_id=run_id)
             return []
         survivors = [by_hash[s.infohash] for s in decision.scores
                      if s.infohash in by_hash]
@@ -2178,10 +2420,10 @@ class DownloadManager:
                 chosen = seeded
             else:
                 return self._race_or_defer(
-                    key, survivors, show.media_type, minutes=minutes,
+                    deferral_key, survivors, show.media_type, minutes=minutes,
                     request_id=request_id,
                     episode_context=(show.show_id, ep.season, ep.episode))
-        if not self._oversize_gate(survivors, show.media_type, key,
+        if not self._oversize_gate(survivors, show.media_type, deferral_key,
                                    minutes=minutes, pref_override=pref_override):
             downloads_store.record_selection_run(decision, request_id=request_id)
             return []
@@ -2226,9 +2468,50 @@ class DownloadManager:
 
         already = downloads_store.request_ids_with_downloads()
         grabbed_identities: set[str] = set()
-        for req in list_requests(status="open", limit=100):
-            if req.request_id in already or req.found_in_library:
+        # Ordinary one-off requests are searched only while OPEN and before
+        # they have a download.  Explicit TV seasons are aggregate jobs: after
+        # E01 is placed the request can be GRABBING/PLACED but E02..E13 still
+        # need work, so keep those active rows in the five-minute pass until
+        # their authoritative episode set is complete.
+        scan_by_id = {
+            req.request_id: req
+            for req in list_requests(status="open", limit=100)
+        }
+        season_resume_statuses = {
+            queue_store.STATUS_OPEN, queue_store.STATUS_DEFERRED,
+            queue_store.STATUS_GRABBING, queue_store.STATUS_VERIFYING,
+            queue_store.STATUS_PLACED,
+        }
+        for active_req in list_requests(status="active", limit=500):
+            if (active_req.media_type in ("tv", "anime", "xanime")
+                    and active_req.season is not None
+                    and active_req.status in season_resume_statuses):
+                scan_by_id.setdefault(active_req.request_id, active_req)
+
+        for req in scan_by_id.values():
+            is_season_request = (
+                req.media_type in ("tv", "anime", "xanime")
+                and req.season is not None)
+            if ((req.request_id in already or req.found_in_library)
+                    and not is_season_request):
                 continue
+
+            # Upgrade old pack-only holds in place.  They meant "the pack was
+            # absent" under the old implementation, not "no episode can be
+            # found", and must not delay the new per-episode fallback.
+            if is_season_request:
+                old_hold = downloads_store.get_grab_deferral(
+                    f"req:{req.request_id}")
+                if (old_hold is not None and old_hold.get("reason") in {
+                        "no seeded season pack available",
+                        "no acceptable season pack found",
+                        "all matching season packs recently failed",
+                }):
+                    downloads_store.clear_grab_deferral(f"req:{req.request_id}")
+                    if req.status == queue_store.STATUS_DEFERRED:
+                        queue_store.set_status(
+                            req.request_id, queue_store.STATUS_OPEN)
+                        req = get_request(req.request_id) or req
             # Grab-gate dedupe: if an identical identity was already handled in
             # this pass, don't grab a second copy of the same thing.
             ident_key = _request_identity_key(req)
@@ -2254,11 +2537,16 @@ class DownloadManager:
                 import maintenance
                 if maintenance.request_present_in_library(req):
                     queue_store.update_library_status(req.request_id, found=True)
+                    if not is_season_request:
+                        logger.info(
+                            "Auto-grab: request #%s (%s) is already in the "
+                            "library at grab time — skipping.",
+                            req.request_id, req.media_type)
+                        continue
                     logger.info(
-                        "Auto-grab: request #%s (%s) is already in the library "
-                        "at grab time — skipping.",
-                        req.request_id, req.media_type)
-                    continue
+                        "Auto-grab: request #%s has some requested-season "
+                        "library presence; checking the full episode set.",
+                        req.request_id)
             except Exception:
                 logger.exception(
                     "At-grab library gate failed for request #%s", req.request_id)
@@ -2270,6 +2558,9 @@ class DownloadManager:
             # movies), never raw user text or a native-script canonical title.
             query = _auto_grab_query(req)
             media_type = req.media_type if req.media_type != "unknown" else "other"
+            request_deferral_key = f"req:{req.request_id}"
+            if self._deferral_active(request_deferral_key):
+                continue
 
             if media_type in ("tv", "anime", "xanime"):
                 try:
@@ -2287,7 +2578,7 @@ class DownloadManager:
                 logger.exception("Auto-grab search failed for request #%s", req.request_id)
                 continue
             minutes = _request_movie_minutes(req)
-            key = f"req:{req.request_id}"
+            key = request_deferral_key
             want = self._want_from_request(
                 req, media_type, mode=torrent_select.MODE_AUTOMATIC_SINGLE,
                 minutes=minutes)
@@ -2303,8 +2594,9 @@ class DownloadManager:
                 # the pass's candidate stats and run id (persisted for the
                 # Task E grab queue) rather than hammering every 5 minutes.
                 if any(v.reason_code == "blocklisted" for v in decision.verdicts):
-                    downloads_store.check_grab_deferral(
-                        key, reason="last viable candidate blocked",
+                    self._defer_for_retry(
+                        key, hours=config.NO_RESULT_DEFER_HOURS,
+                        reason="last viable candidate blocked",
                         candidate_stats=decision.verdict_histogram(),
                         selection_run_id=run_id)
                 elif self._dead_swarm(decision):
@@ -2315,8 +2607,27 @@ class DownloadManager:
                         request_id=req.request_id, request_title=query,
                         run_id=run_id,
                         candidate_stats=decision.verdict_histogram()))
+                else:
+                    skipped = decision.pool_stats.get(
+                        "recent_failures_skipped", 0)
+                    provider_health = decision.pool_stats.get(
+                        "provider_health", {})
+                    all_unavailable = bool(provider_health) and all(
+                        not detail.get("available", True)
+                        for detail in provider_health.values())
+                    if skipped:
+                        reason = "all matching releases recently failed"
+                    elif all_unavailable:
+                        reason = "torrent providers temporarily unavailable"
+                    else:
+                        reason = "no acceptable release found"
+                    self._defer_for_retry(
+                        key, hours=config.NO_RESULT_DEFER_HOURS,
+                        reason=reason,
+                        candidate_stats=decision.verdict_histogram(),
+                        selection_run_id=run_id)
                 logger.info("Request #%s (%s): no acceptable result this pass — "
-                            "will retry on the next auto-grab cycle.",
+                            "deferred before the next provider search.",
                             req.request_id, query)
                 continue
             survivors = [by_hash[s.infohash] for s in decision.scores
@@ -2455,10 +2766,9 @@ class DownloadManager:
             candidate_stats=candidate_stats, selection_run_id=run_id)
         # A request-level single grab is genuinely held: flip it to 'deferred' so
         # the open scan skips it until reopen_expired_deferrals brings it back.
-        # Episode/pack keys are not request-status-driven, so they only record
-        # the row (matching the existing chosen-None behaviour there).
-        if (request_id is not None and episode_context is None
-                and key == f"req:{request_id}"):
+        # Tracked-show maintenance has no request id and keeps an episode key;
+        # request-linked episode/pack work uses req:<id> and is held visibly.
+        if request_id is not None and key == f"req:{request_id}":
             req_now = get_request(request_id)
             if req_now is not None and req_now.status in (
                     queue_store.STATUS_OPEN, queue_store.STATUS_GRABBING):
@@ -2732,6 +3042,7 @@ class DownloadManager:
                 download_id, "error", error=f"qBittorrent: {exc}", completed=True)
             downloads_store.add_history(download_id, "error", before=None, after=str(exc))
             self._notify(download_id)
+            self._maybe_start_next()
             return
 
         with self._lock:
@@ -2741,6 +3052,7 @@ class DownloadManager:
         last_progress_at = time.time()
         last_progress = -1.0
         files_pruned = False
+        completed_rel_paths: list[str] = []
         try:
             while True:
                 time.sleep(3)
@@ -2754,13 +3066,12 @@ class DownloadManager:
                         error_message = "torrent never appeared in qBittorrent"
                         break
                     continue
-                # Season pack, single wanted episode: deselect every other
-                # video file so only the target episode downloads.
-                if (not files_pruned and row.season is not None
-                        and row.episode is not None and info.get("hash")):
+                # Metadata is now available: apply the same media/language and
+                # optional episode/season selection used by WebTorrent.
+                if not files_pruned and info.get("hash"):
                     files_pruned = True
                     try:
-                        self._qbit_prune_to_episode(
+                        self._qbit_prune_payload(
                             client, str(info["hash"]), row.season, row.episode)
                     except Exception:
                         logger.debug("qBittorrent file pruning failed.", exc_info=True)
@@ -2776,6 +3087,13 @@ class DownloadManager:
                     break
                 if progress >= 1.0 or state in ("uploading", "stalledUP", "pausedUP",
                                                 "queuedUP", "checkingUP", "stoppedUP"):
+                    if info.get("hash"):
+                        completed_rel_paths = [
+                            str(file_info.get("name"))
+                            for file_info in client.files(str(info["hash"]))
+                            if (file_info.get("name")
+                                and int(file_info.get("priority", 1)) > 0)
+                        ]
                     break  # download complete (seeding states)
                 if time.time() - last_progress_at > config.TORRENT_STALL_TIMEOUT_SECONDS:
                     error_message = "stalled — no progress within the timeout"
@@ -2799,51 +3117,62 @@ class DownloadManager:
 
         downloads_store.set_progress(download_id, 1.0)
         downloads_store.set_status(download_id, "downloaded", completed=True)
-        try:
-            info = client.info_by_tag(tag)
-            if info and info.get("hash"):
-                rel_paths = [str(f.get("name")) for f in client.files(str(info["hash"]))
-                             if f.get("name")]
-                if rel_paths:
-                    downloads_store.set_files(download_id, rel_paths)
-        except Exception:
-            logger.debug("qBittorrent file-list capture failed.", exc_info=True)
+        if completed_rel_paths:
+            downloads_store.set_files(download_id, completed_rel_paths)
         downloads_store.add_history(download_id, "downloaded", before=None,
                                     after=f"{staging} (via qBittorrent)")
         self._notify(download_id)
-        outcome = self._post_process(download_id, request_title=request_title)
+        outcome = self._finish_post_process(
+            download_id, request_title=request_title)
         logger.info("Download #%s post-process: %s", download_id, outcome)
         self._notify(download_id)
 
     @staticmethod
-    def _qbit_prune_to_episode(client: _QBitClient, torrent_hash: str,
-                               season: int, episode: int) -> None:
-        """Inside a multi-file torrent, keep only the wanted episode's video
-        (plus subtitles); everything else is set to priority 0 (skip)."""
+    def _qbit_prune_payload(client: _QBitClient, torrent_hash: str,
+                            season: int | None, episode: int | None) -> None:
+        """Select media + wanted-language subs, optionally one episode/season."""
         files = client.files(torrent_hash)
         if len(files) < 2:
             return
         keep_exts = torrent_routing.VIDEO_EXTENSIONS | torrent_routing.SUBTITLE_EXTENSIONS
         wanted_videos: list[int] = []
+        video_rows: list[tuple[int, Any, bool]] = []
         skip: list[int] = []
         for idx, f in enumerate(files):
-            name = Path(str(f.get("name") or "")).name
-            suffix = Path(name).suffix.lower()
+            path = Path(str(f.get("name") or ""))
+            name = path.name
+            suffix = path.suffix.lower()
             file_id = int(f.get("index", idx))
             if suffix not in keep_exts:
                 skip.append(file_id)
                 continue
             parsed = torrent_routing.parse_torrent_name(name)
-            matches = (parsed.episode == episode
-                       and (parsed.season is None or parsed.season == season))
             if suffix in torrent_routing.VIDEO_EXTENSIONS:
-                (wanted_videos if matches else skip).append(file_id)
-        # Only prune when we positively identified the target episode —
-        # otherwise download everything rather than guess wrong.
-        if wanted_videos:
-            client.set_file_priority(torrent_hash, skip, 0)
-            logger.info("qBittorrent: pruned pack to S%02dE%02d (%d file(s) skipped)",
-                        season, episode, len(skip))
+                matches = True
+                if episode is not None:
+                    matches = (parsed.episode == episode
+                               and (season is None or parsed.season == season))
+                elif season is not None and parsed.season is not None:
+                    matches = parsed.season == season
+                video_rows.append((file_id, parsed, matches))
+                if matches:
+                    wanted_videos.append(file_id)
+            else:
+                try:
+                    from subtitles import subtitle_language_ok
+                    if not subtitle_language_ok(path):
+                        skip.append(file_id)
+                except ImportError:
+                    pass
+        # Prune nonmatching videos only after positively identifying at least
+        # one requested video; otherwise preserve all videos rather than guess.
+        if ((episode is not None or season is not None) and wanted_videos):
+            skip.extend(file_id for file_id, _parsed, matches in video_rows
+                        if not matches)
+        client.set_file_priority(torrent_hash, sorted(set(skip)), 0)
+        if skip:
+            logger.info("qBittorrent: skipped %d unrelated/non-media file(s).",
+                        len(set(skip)))
 
     def _run_download_node(self, download_id: int, magnet: str, staging: str,
                            request_title: str | None) -> None:
@@ -2861,9 +3190,11 @@ class DownloadManager:
             self._maybe_start_next()
             return
 
+        row_for_options = downloads_store.get_download(download_id)
+        options = self._runner_selection_options(row_for_options)
         cmd = [
             config.NODE_PATH, str(_RUNNER_PATH), magnet, staging,
-            str(config.TORRENT_STALL_TIMEOUT_SECONDS),
+            str(config.TORRENT_STALL_TIMEOUT_SECONDS), json.dumps(options),
         ]
         try:
             # stderr merges into stdout: the JSON reader skips non-JSON
@@ -2882,6 +3213,7 @@ class DownloadManager:
             )
             downloads_store.add_history(download_id, "error", before=None, after=str(exc))
             self._notify(download_id)
+            self._maybe_start_next()
             return
 
         with self._lock:
@@ -2913,6 +3245,14 @@ class DownloadManager:
                 elif kind == "metadata":
                     torrent_files = event.get("files") or []
                     metadata_seen = True
+                    rel_paths = [str(file_info.get("path"))
+                                 for file_info in torrent_files
+                                 if file_info.get("path")]
+                    if rel_paths:
+                        # Persist at metadata time, not only after success. A
+                        # stalled/error payload still has an exact ownership
+                        # manifest for audit, cleanup, and recovery.
+                        downloads_store.set_files(download_id, rel_paths)
                 elif kind == "done":
                     torrent_files = event.get("files") or torrent_files
                 elif kind == "error":
@@ -2970,10 +3310,132 @@ class DownloadManager:
         self._notify(download_id)
 
         # Post-process according to the flags chosen at grab time.
-        outcome = self._post_process(download_id, request_title=request_title)
+        outcome = self._finish_post_process(
+            download_id, request_title=request_title)
         logger.info("Download #%s post-process: %s", download_id, outcome)
         self._notify(download_id)
         self._maybe_start_next()
+
+    def _reconcile_prior_move(self, row: downloads_store.DownloadRow) -> list[str]:
+        """Restore a stale ``downloaded`` row whose audited move still exists.
+
+        This deliberately accepts only exact final paths previously written by
+        Sensarr to download provenance/history.  Merely finding a similar title
+        somewhere in a library is not evidence that this payload was placed.
+        """
+        candidates: list[str] = []
+        for placed in downloads_store.list_download_files(row.download_id):
+            if (placed.final_path
+                    and placed.verification_state in ("verified", "duplicate")):
+                candidates.append(placed.final_path)
+        for history in downloads_store.history_for_download(row.download_id):
+            if history.action == "moved" and history.after_value:
+                candidates.append(history.after_value)
+
+        existing: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            path = Path(candidate)
+            key = str(path).casefold()
+            if (key in seen or not path.is_file()
+                    or path.suffix.lower() not in torrent_routing.VIDEO_EXTENSIONS):
+                continue
+            seen.add(key)
+            existing.append(str(path))
+        if not existing:
+            return []
+
+        downloads_store.set_status(row.download_id, "moved", completed=True)
+        downloads_store.set_verification(
+            row.download_id, "verified",
+            reason="reconciled from exact prior move audit path")
+        downloads_store.add_history(
+            row.download_id, "reconciled", before="downloaded",
+            after="exact prior move still exists: " + ", ".join(existing))
+        self._on_download_placed(row, existing)
+        return existing
+
+    @staticmethod
+    def _runner_selection_options(
+            row: downloads_store.DownloadRow | None) -> dict[str, Any]:
+        """File-selection contract handed to WebTorrent after metadata.
+
+        Extensions come from the Python routing authority and language tokens
+        come from subtitles.py, so the runner does not grow independent,
+        drifting definitions of the files Sensarr wants.
+        """
+        from subtitles import subtitle_language_filter_spec
+
+        spec = subtitle_language_filter_spec()
+        return {
+            "videoExtensions": sorted(torrent_routing.VIDEO_EXTENSIONS),
+            "subtitleExtensions": sorted(torrent_routing.SUBTITLE_EXTENSIONS),
+            "subtitleLanguage": spec,
+            "season": row.season if row is not None else None,
+            "episode": row.episode if row is not None else None,
+            "maxRuntimeSeconds": max(
+                0, int(config.TORRENT_MAX_RUNTIME_HOURS * 3600)),
+        }
+
+    def _finish_post_process(self, download_id: int, *,
+                             request_title: str | None,
+                             force_move: bool = False,
+                             force_rename: bool = False) -> str:
+        """Run import without letting a completed payload become immortal.
+
+        A post-processing exception is not a torrent failure: complete bytes
+        remain in staging, the download becomes visibly "needs import", and
+        its request becomes actionable instead of being downloaded again. A
+        payload with no primary media *is* a bad torrent result and re-enters
+        the normal failed-grab lifecycle.
+        """
+        try:
+            outcome = self._post_process(
+                download_id, request_title=request_title,
+                force_move=force_move, force_rename=force_rename)
+        except Exception as exc:
+            logger.exception("Download #%s import/post-process failed.", download_id)
+            message = f"import failed: {exc}"
+            downloads_store.set_status(
+                download_id, "downloaded", error=message, completed=True)
+            downloads_store.add_history(
+                download_id, "import_error", before=None, after=message)
+            row = downloads_store.get_download(download_id)
+            if row is not None and row.request_id is not None:
+                queue_store.set_status(
+                    row.request_id, queue_store.STATUS_NEEDS_ATTENTION)
+            self._notify(download_id)
+            return message
+
+        if (outcome.startswith("no media files found")
+                or "no primary/episode video" in outcome):
+            downloads_store.set_status(
+                download_id, "error", error=outcome, completed=True)
+            downloads_store.add_history(
+                download_id, "error", before=None, after=outcome)
+        elif outcome.startswith("left in staging — route not confident"):
+            downloads_store.set_status(
+                download_id, "downloaded",
+                error="needs placement: " + outcome, completed=True)
+            row = downloads_store.get_download(download_id)
+            if row is not None and row.request_id is not None:
+                queue_store.set_status(
+                    row.request_id, queue_store.STATUS_NEEDS_ATTENTION)
+        elif outcome.startswith("processed (no move)"):
+            # The payload is complete, but an unattributed different file at
+            # the canonical target prevented placement.  Keep both files and
+            # surface the collision as an import problem; never overwrite the
+            # library copy and never redownload the completed staged payload.
+            message = "needs import: " + outcome
+            downloads_store.set_status(
+                download_id, "downloaded", error=message, completed=True)
+            downloads_store.add_history(
+                download_id, "import_error", before=None, after=message)
+            row = downloads_store.get_download(download_id)
+            if row is not None and row.request_id is not None:
+                queue_store.set_status(
+                    row.request_id, queue_store.STATUS_NEEDS_ATTENTION)
+        return outcome
 
     # ------------------------------------------------------------------
     # Post-processing: rename + move with full history
@@ -3059,6 +3521,13 @@ class DownloadManager:
             planned_name=plan.new_filename, route_reason=plan.reason,
         )
 
+        # A placement problem is actionable only while the payload still
+        # exists. Check exact staging ownership before route confidence so a
+        # vanished legacy file cannot masquerade forever as "needs placement".
+        files = self._media_files_in_staging(row)
+        if not files:
+            return "no media files found in staging for this download"
+
         if not do_move and not do_rename:
             return f"left in staging (auto rename/move off) — planned: {plan.describe()}"
         if not plan.confident:
@@ -3067,10 +3536,6 @@ class DownloadManager:
             # queue with a one-click create-folder action.
             self._record_needs_placement(row, plan)
             return f"left in staging — route not confident: {plan.reason}"
-
-        files = self._media_files_in_staging(row)
-        if not files:
-            return "no media files found in staging for this download"
 
         # -- IDENTITY GATE (verify BEFORE any move; Design stance 5) ----------
         # Compare the ACTUAL staged files against the immutable want_json via
@@ -3128,15 +3593,27 @@ class DownloadManager:
         movie_video_stem = plan.new_filename if row.media_type == "movie" else None
 
         # Collision safety (Phase 5 gate: collisions never overwrite).
-        # prior_intended: names THIS download planned in an EARLIER pass — the
-        # only targets whose smaller on-disk copy may be treated as our own
-        # interrupted partial move. Snapshot BEFORE the loop (the loop appends
-        # its own 'renamed' rows). placed_this_pass: targets already taken by
-        # another file of this payload in THIS pass.
-        prior_intended = {
-            h.after_value for h in downloads_store.history_for_download(download_id)
-            if h.action in ("renamed", "moved") and h.after_value
-        }
+        # A prior *planned rename* is not ownership evidence for a file already
+        # at the destination. Earlier code treated it as proof of an
+        # interrupted partial copy; on a retry that could replace an unrelated,
+        # smaller library file. Explicit quality replacement is handled by the
+        # replace_path branch below. Every other different-size collision stays
+        # staged for review.
+        unclosed_moves: dict[str, int] = {}
+        for history in downloads_store.history_for_download(download_id):
+            if history.action == "move_started" and history.after_value:
+                try:
+                    detail = json.loads(history.after_value)
+                    target = str(detail.get("target") or "")
+                    expected_size = int(detail.get("expected_size") or 0)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if target and expected_size > 0:
+                    unclosed_moves[target.casefold()] = expected_size
+            elif history.action == "moved" and history.after_value:
+                # A completed move closes the preceding intent. Only a crash
+                # between move_started and moved may own a partial target.
+                unclosed_moves.pop(str(history.after_value).casefold(), None)
         placed_this_pass: set[str] = set()
 
         roles: dict[str, str] = {}
@@ -3169,7 +3646,12 @@ class DownloadManager:
                 pf = verification.parse_file(src)
                 downloads_store.add_download_file(
                     download_id,
-                    source_relative_path=src.name,
+                    source_relative_path=(
+                        str(src.relative_to(Path(
+                            row.staging_dir or config.TORRENT_DOWNLOAD_DIR)))
+                        if src.is_relative_to(Path(
+                            row.staging_dir or config.TORRENT_DOWNLOAD_DIR))
+                        else src.name),
                     source_absolute_path=str(src),
                     media_role=role, parsed_title=pf.parsed_title,
                     parsed_year=pf.year,
@@ -3288,26 +3770,21 @@ class DownloadManager:
                             moved_final_paths.append(str(target))
                         continue
                     try:
-                        target_smaller = target.stat().st_size < src.stat().st_size
+                        source_size = src.stat().st_size
+                        target_smaller = target.stat().st_size < source_size
                     except OSError:
+                        source_size = 0
                         target_smaller = False
-                    # A smaller file at the target is replaced ONLY when it is
-                    # attributable to THIS download's own interrupted earlier
-                    # move (same release filename, or a name this download
-                    # planned before). An unattributed file is someone else's
-                    # media and is NEVER overwritten.
-                    ours = (target.name == src.name
-                            or target.name in prior_intended
-                            or str(target) in prior_intended)
-                    if target_smaller and ours:
-                        # Interrupted cross-drive move left a partial copy —
-                        # replace it with the complete staged file.
+                    expected_size = unclosed_moves.get(str(target).casefold())
+                    if (target_smaller and source_size > 0
+                            and expected_size == source_size):
+                        # Exact durable evidence says Sensarr began moving THIS
+                        # source to THIS target and never recorded completion.
                         target.unlink(missing_ok=True)
                         downloads_store.add_history(
                             download_id, "replaced", before=str(target),
-                            after="partial copy from an interrupted move — replaced",
-                        )
-                        # fall through to the normal move below
+                            after="partial copy from an audited interrupted "
+                                  "move — replaced")
                     else:
                         downloads_store.add_history(
                             download_id, "error", before=str(src),
@@ -3318,6 +3795,16 @@ class DownloadManager:
                         if is_gating:
                             skipped_gating += 1
                         continue
+                try:
+                    expected_size = src.stat().st_size
+                except OSError:
+                    expected_size = 0
+                downloads_store.add_history(
+                    download_id, "move_started", before=str(src),
+                    after=json.dumps({
+                        "target": str(target),
+                        "expected_size": expected_size,
+                    }, sort_keys=True))
                 shutil.move(str(src), str(target))
                 placed_this_pass.add(str(target).casefold())
                 downloads_store.add_history(
@@ -3612,20 +4099,45 @@ class DownloadManager:
         return f"created {target} — {out}"
 
     def _cleanup_staging_leftovers(self, row: downloads_store.DownloadRow) -> None:
-        """Remove the download's now-empty (or junk-only) staging folder."""
+        """Remove only exact, harmless leftovers owned by this download.
+
+        The old implementation chose a folder by 0.5 fuzzy title similarity
+        and recursively deleted it when its extensions looked like junk. In a
+        shared staging root that is not a safe ownership boundary. The engine
+        manifest is now authoritative; media/sample/extra files are preserved
+        for review and only exact junk plus empty parent directories are
+        removed.
+        """
         staging = Path(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
-        if not staging.is_dir():
+        if not staging.is_dir() or not row.files_json:
             return
-        for entry in staging.iterdir():
-            if not entry.is_dir():
+        try:
+            rel_paths = json.loads(row.files_json)
+        except (TypeError, ValueError):
+            return
+        junk_exts = {".nfo", ".txt", ".jpg", ".png", ".sfv", ".exe", ".url"}
+        parent_dirs: set[Path] = set()
+        for rel in rel_paths:
+            path = staging / str(rel)
+            try:
+                path.relative_to(staging)
+            except ValueError:
                 continue
-            if torrent_routing._folder_similarity(entry.name, row.title) < 0.5:
-                continue
-            remaining = [f for f in entry.rglob("*") if f.is_file()]
-            junk_exts = {".nfo", ".txt", ".jpg", ".png", ".sfv", ".exe", ".url"}
-            if all(f.suffix.lower() in junk_exts for f in remaining):
-                shutil.rmtree(entry, ignore_errors=True)
-            break
+            parent_dirs.update(
+                parent for parent in path.parents if parent != staging
+                and staging in parent.parents)
+            if path.is_file() and path.suffix.lower() in junk_exts:
+                try:
+                    path.unlink()
+                except OSError:
+                    logger.debug("Could not remove staged junk %s", path,
+                                 exc_info=True)
+        for directory in sorted(parent_dirs, key=lambda value: len(value.parts),
+                                reverse=True):
+            try:
+                directory.rmdir()  # succeeds only when empty
+            except OSError:
+                pass
 
     def _notify(self, download_id: int) -> None:
         if self._on_update is not None:

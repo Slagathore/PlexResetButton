@@ -897,7 +897,8 @@ class DesktopApp:
 
         self.requests_tree = ttk.Treeview(
             requests_frame,
-            columns=("id", "type", "requester", "created", "title", "status"),
+            columns=("id", "type", "requester", "created", "title", "state",
+                     "in_library"),
             show="headings",
             height=10,
         )
@@ -906,13 +907,15 @@ class DesktopApp:
         self.requests_tree.heading("requester", text="Requester")
         self.requests_tree.heading("created",   text="Created")
         self.requests_tree.heading("title",     text="Title / Request")
-        self.requests_tree.heading("status",    text="In Library")
+        self.requests_tree.heading("state",     text="State")
+        self.requests_tree.heading("in_library", text="In Library")
         self.requests_tree.column("id",        width=50,  anchor=tk.CENTER, stretch=False)
         self.requests_tree.column("type",      width=70,  anchor=tk.CENTER, stretch=False)
         self.requests_tree.column("requester", width=130, anchor=tk.W,      stretch=False)
         self.requests_tree.column("created",   width=140, anchor=tk.W,      stretch=False)
-        self.requests_tree.column("title",     width=360, anchor=tk.W)
-        self.requests_tree.column("status",    width=70,  anchor=tk.CENTER, stretch=False)
+        self.requests_tree.column("title",     width=310, anchor=tk.W)
+        self.requests_tree.column("state",     width=105, anchor=tk.W,      stretch=False)
+        self.requests_tree.column("in_library", width=70, anchor=tk.CENTER, stretch=False)
         self.requests_tree.grid(row=0, column=0, sticky="nsew")
 
         requests_scroll = ttk.Scrollbar(requests_frame, orient=tk.VERTICAL, command=self.requests_tree.yview)
@@ -1306,22 +1309,26 @@ class DesktopApp:
         for request in requests:
             row_id = str(request.request_id)
             display_title = request.resolved_title or request.content
+            if request.season is not None:
+                display_title = f"{display_title} — Season {int(request.season)}"
             if request.status == "needs_identity":
                 display_title = f"{display_title}  [needs identity]"
             type_label = self._TYPE_LABEL.get(request.media_type, "?")
             in_library = "YES" if request.found_in_library else ""
+            lifecycle = request.status.replace("_", " ").title()
             self.requests_tree.insert(
                 "", "end", iid=row_id,
                 values=(
                     request.request_id, type_label, request.requester,
-                    _local_ts(request.created_at), display_title, in_library,
+                    _local_ts(request.created_at), display_title, lifecycle,
+                    in_library,
                 ),
             )
 
         if selected_id and self.requests_tree.exists(selected_id):
             self.requests_tree.selection_set(selected_id)
 
-        self.queue_var.set(f"Open requests: {open_request_count()}")
+        self.queue_var.set(f"Outstanding requests: {open_request_count()}")
 
     def _on_request_selected(self, _event: Any) -> None:
         if self.requests_tree is None or self.request_detail_text is None:
@@ -2479,22 +2486,24 @@ class DesktopApp:
         add_tooltip(dl_btn, "Download the selected result to the staging folder; "
                             "renamed/moved per the checkboxes below.")
 
-        options = ttk.Frame(tab)
+        options = ttk.LabelFrame(tab, text="Automation", padding=(8, 5))
         options.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        options.columnconfigure(3, weight=1)
         ttk.Checkbutton(
             options, text="Automatic rename", variable=self._dl_auto_rename_var,
             command=lambda: self._persist_dl_toggle("TORRENT_AUTO_RENAME", self._dl_auto_rename_var),
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        ).grid(row=0, column=0, sticky="w", padx=(0, 18))
         ttk.Checkbutton(
             options, text="Move to destination", variable=self._dl_auto_move_var,
             command=lambda: self._persist_dl_toggle("TORRENT_AUTO_MOVE", self._dl_auto_move_var),
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        ).grid(row=0, column=1, sticky="w", padx=(0, 18))
         ttk.Checkbutton(
             options, text="Auto-grab new requests", variable=self._dl_auto_grab_var,
             command=lambda: self._persist_dl_toggle("TORRENT_AUTO_GRAB", self._dl_auto_grab_var),
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        ).grid(row=0, column=2, sticky="w")
         ttk.Label(options, textvariable=self._dl_plan_var, foreground=_MUTED_TEXT,
-                  font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(8, 0))
+                  font=("Segoe UI", 9, "italic"), anchor="w").grid(
+                      row=1, column=0, columnspan=4, sticky="ew", pady=(5, 0))
 
         panes = ttk.PanedWindow(tab, orient=tk.VERTICAL)
         panes.grid(row=2, column=0, sticky="nsew")
@@ -2518,24 +2527,33 @@ class DesktopApp:
         results_tree.grid(row=0, column=0, sticky="nsew")
         results_scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=results_tree.yview)
         results_scroll.grid(row=0, column=1, sticky="ns")
-        results_tree.configure(yscrollcommand=results_scroll.set)
+        results_xscroll = ttk.Scrollbar(
+            results_frame, orient=tk.HORIZONTAL, command=results_tree.xview)
+        results_xscroll.grid(row=1, column=0, sticky="ew")
+        results_tree.configure(yscrollcommand=results_scroll.set,
+                               xscrollcommand=results_xscroll.set)
         results_tree.bind("<<TreeviewSelect>>", lambda _e: self._preview_route_for_selected_result())
         results_tree.bind("<Double-1>", lambda _e: self.download_selected_result())
         make_sortable(results_tree)
         self._dl_results_tree = results_tree
 
-        downloads_frame = ttk.LabelFrame(panes, text="Downloads", padding=4)
-        panes.add(downloads_frame, weight=2)
-        downloads_frame.columnconfigure(0, weight=1)
-        downloads_frame.rowconfigure(1, weight=1)
+        lower_tabs = ttk.Notebook(panes)
+        panes.add(lower_tabs, weight=2)
 
-        dl_bar = ttk.Frame(downloads_frame)
-        dl_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        ttk.Label(dl_bar, textvariable=self._dl_status_var, foreground=_MUTED_TEXT).pack(side=tk.LEFT)
-        ttk.Button(dl_bar, text="Open Staging Folder", command=self.open_staging_folder).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(dl_bar, text="Cancel", command=self.cancel_selected_download).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(dl_bar, text="Apply Route", command=self.apply_route_to_selected_download).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(dl_bar, text="Refresh", command=self.refresh_downloads).pack(side=tk.RIGHT, padx=(6, 0))
+        downloads_frame = ttk.Frame(lower_tabs, padding=6)
+        lower_tabs.add(downloads_frame, text="Queue & completed")
+        downloads_frame.columnconfigure(0, weight=1)
+        downloads_frame.rowconfigure(2, weight=1)
+
+        ttk.Label(downloads_frame, textvariable=self._dl_status_var,
+                  foreground=_MUTED_TEXT, anchor="w").grid(
+                      row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        dl_actions = ttk.Frame(downloads_frame)
+        dl_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(dl_actions, text="Refresh", command=self.refresh_downloads).pack(side=tk.LEFT)
+        ttk.Button(dl_actions, text="Apply Route", command=self.apply_route_to_selected_download).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(dl_actions, text="Cancel", command=self.cancel_selected_download).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(dl_actions, text="Open Staging Folder", command=self.open_staging_folder).pack(side=tk.RIGHT)
 
         downloads_tree = ttk.Treeview(
             downloads_frame, columns=("id", "title", "status", "progress", "route"),
@@ -2550,17 +2568,20 @@ class DesktopApp:
         ):
             downloads_tree.heading(col, text=text)
             downloads_tree.column(col, width=width, anchor=cast(Any, anchor), stretch=stretch)
-        downloads_tree.grid(row=1, column=0, sticky="nsew")
+        downloads_tree.grid(row=2, column=0, sticky="nsew")
         downloads_scroll = ttk.Scrollbar(downloads_frame, orient=tk.VERTICAL, command=downloads_tree.yview)
-        downloads_scroll.grid(row=1, column=1, sticky="ns")
-        downloads_tree.configure(yscrollcommand=downloads_scroll.set)
+        downloads_scroll.grid(row=2, column=1, sticky="ns")
+        downloads_xscroll = ttk.Scrollbar(
+            downloads_frame, orient=tk.HORIZONTAL, command=downloads_tree.xview)
+        downloads_xscroll.grid(row=3, column=0, sticky="ew")
+        downloads_tree.configure(yscrollcommand=downloads_scroll.set,
+                                 xscrollcommand=downloads_xscroll.set)
         downloads_tree.bind("<Button-3>", self._on_download_right_click)
         make_sortable(downloads_tree)
         self._dl_downloads_tree = downloads_tree
 
-        history_frame = ttk.LabelFrame(
-            panes, text="History (downloads / renames / moves — before → after)", padding=4)
-        panes.add(history_frame, weight=1)
+        history_frame = ttk.Frame(lower_tabs, padding=6)
+        lower_tabs.add(history_frame, text="History · downloads / renames / moves")
         history_frame.columnconfigure(0, weight=1)
         history_frame.rowconfigure(0, weight=1)
         history_tree = ttk.Treeview(
@@ -2578,7 +2599,11 @@ class DesktopApp:
         history_tree.grid(row=0, column=0, sticky="nsew")
         history_scroll = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=history_tree.yview)
         history_scroll.grid(row=0, column=1, sticky="ns")
-        history_tree.configure(yscrollcommand=history_scroll.set)
+        history_xscroll = ttk.Scrollbar(
+            history_frame, orient=tk.HORIZONTAL, command=history_tree.xview)
+        history_xscroll.grid(row=1, column=0, sticky="ew")
+        history_tree.configure(yscrollcommand=history_scroll.set,
+                               xscrollcommand=history_xscroll.set)
         make_sortable(history_tree)
         self._dl_history_tree = history_tree
 
@@ -2794,9 +2819,18 @@ class DesktopApp:
         selected_id = self._selected_download_id()
         for item in self._dl_downloads_tree.get_children():
             self._dl_downloads_tree.delete(item)
-        for row in sorted(downloads_store.list_downloads(limit=100),
-                          key=self._download_row_order):
-            route = row.error if row.status == "error" else (
+        # Always surface every active/complete-but-unimported payload, even if
+        # hundreds of newer error/history rows would push it past a newest-N
+        # query. Recent terminal rows are then merged in for context.
+        visible = {
+            row.download_id: row
+            for row in downloads_store.list_downloads_by_status(
+                ("queued", "downloading", "downloaded"))
+        }
+        for row in downloads_store.list_downloads(limit=150):
+            visible.setdefault(row.download_id, row)
+        for row in sorted(visible.values(), key=self._download_row_order):
+            route = row.error if row.error else (
                 (f"{row.planned_dest or ''}" + (f" / {row.planned_name}" if row.planned_name else ""))
                 or row.route_reason or ""
             )
@@ -2959,21 +2993,6 @@ class DesktopApp:
     def _auto_grab_tick(self) -> None:
         if self._quitting:
             return
-        if config.TORRENT_AUTO_GRAB:
-            def worker() -> None:
-                try:
-                    started = self.download_manager.auto_grab_open_requests()
-                except Exception:
-                    logger.exception("Auto-grab pass failed.")
-                    return
-                if started:
-                    self._post_to_ui(self.refresh_downloads)
-            threading.Thread(target=worker, name="ui-auto-grab", daemon=True).start()
-
-        # Shows loop: auto-grab missing episodes at most every 6 hours (the
-        # pass re-syncs stale shows itself, so freshly-aired episodes appear).
-        # THE BUG THAT STRANDED TANYA S02E01: this used to require the GLOBAL
-        # toggle, so per-show 🆕/✅ flags never triggered a pass at all.
         def _any_flagged() -> bool:
             try:
                 import shows_store as _ss
@@ -2981,11 +3000,35 @@ class DesktopApp:
             except Exception:
                 return False
 
-        if (time.time() - self._last_shows_grab_pass > 6 * 3600
-                and (config.SHOWS_AUTO_GRAB or _any_flagged())):
+        run_request_pass = bool(config.TORRENT_AUTO_GRAB)
+        # Shows loop: auto-grab missing episodes at most every 6 hours (the
+        # pass re-syncs stale shows itself, so freshly-aired episodes appear).
+        # THE BUG THAT STRANDED TANYA S02E01: this used to require the GLOBAL
+        # toggle, so per-show 🆕/✅ flags never triggered a pass at all.
+        run_shows_pass = (
+            time.time() - self._last_shows_grab_pass > 6 * 3600
+            and (config.SHOWS_AUTO_GRAB or _any_flagged()))
+        if run_shows_pass:
             self._last_shows_grab_pass = time.time()
 
-            def shows_worker() -> None:
+        if run_request_pass or run_shows_pass:
+            def worker() -> None:
+                # These passes can both sync tracked-show episode grids.  They
+                # used to launch as competing threads at the same instant on
+                # startup; the loser saw ShowsBusyError and season requests
+                # were incorrectly deferred for six hours.  One worker keeps
+                # the network/database pipelines serialized without blocking
+                # Tk's UI thread.
+                if run_request_pass:
+                    try:
+                        started = self.download_manager.auto_grab_open_requests()
+                    except Exception:
+                        logger.exception("Auto-grab pass failed.")
+                    else:
+                        if started:
+                            self._post_to_ui(self.refresh_downloads)
+                if not run_shows_pass:
+                    return
                 try:
                     started = self.download_manager.auto_grab_missing_episodes()
                 except Exception:
@@ -2995,7 +3038,8 @@ class DesktopApp:
                     logger.info("Shows auto-grab started %d download(s).", len(started))
                     self._post_to_ui(self.refresh_downloads)
                     self._post_to_ui(self.shows_tab.refresh)
-            threading.Thread(target=shows_worker, name="ui-shows-auto-grab", daemon=True).start()
+            threading.Thread(
+                target=worker, name="ui-auto-grab", daemon=True).start()
 
         self.root.after(300_000, self._auto_grab_tick)
 

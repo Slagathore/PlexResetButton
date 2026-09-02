@@ -150,7 +150,13 @@ def test_auto_grab_pass_reopens_expired_deferrals(monkeypatch):
 
     dm.auto_grab_open_requests()
 
-    assert queue_store.get_request(req.request_id).status == queue_store.STATUS_OPEN
+    # The expired hold was reopened and searched. With no acceptable result it
+    # receives a fresh bounded hold instead of being hammered every five
+    # minutes by the same zero-result provider query.
+    assert queue_store.get_request(req.request_id).status == queue_store.STATUS_DEFERRED
+    detail = downloads_store.get_grab_deferral(f"req:{req.request_id}")
+    assert detail is not None
+    assert detail["reason"] == "no acceptable release found"
 
 
 def test_blocked_pass_defers_with_stats_and_run_id(monkeypatch):
@@ -338,7 +344,7 @@ def test_needs_identity_row_and_season_subject_key():
     assert "resolve" in ni_row.reason.lower()
     tv_row = next(r for r in rows if r.request_id == tv.request_id)
     assert tv_row.subject_key == "tvdb:55:s2"
-    assert tv_row.display_title == "Known Show S02"
+    assert tv_row.display_title == "Known Show — Season 2"
 
 
 def test_needs_attention_row_carries_verification_reason():

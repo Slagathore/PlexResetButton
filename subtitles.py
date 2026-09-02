@@ -135,6 +135,25 @@ def subtitle_language_ok(path, preferred: str | None = None) -> bool:
     return bool(found_langs & wanted)
 
 
+def subtitle_language_filter_spec(preferred: str | None = None) -> dict[str, object]:
+    """Serializable language-token rules for the torrent runner.
+
+    WebTorrent can deselect unwanted files as soon as metadata arrives, before
+    their bytes are downloaded. Keeping the tokens here means that early rule
+    and the later import rule cannot silently drift apart. Untagged subtitle
+    files remain allowed as a conservative fallback.
+    """
+    import config as _config
+
+    language = (preferred or _config.SUBTITLE_LANGUAGE or "en").casefold()
+    wanted = _LANG_ALIASES.get(language, {language})
+    return {
+        "preferred": language,
+        "wantedTokens": sorted(wanted),
+        "allLanguageTokens": sorted(_ALL_LANG_TOKENS),
+    }
+
+
 def subtitles_available() -> bool:
     try:
         import subliminal  # noqa: F401

@@ -150,6 +150,32 @@ def test_no_subtitle_movie_still_foldered(tmp_path, monkeypatch):
     assert (movies / "Dune (2021) {tmdb-438631}" / "Dune (2021).mkv").is_file()
 
 
+def test_prior_planned_rename_never_authorizes_collision_overwrite(
+        tmp_path, monkeypatch):
+    movies = tmp_path / "Movies"
+    _movie_root(monkeypatch, movies)
+    staging = tmp_path / "staging"
+    staged = _write(
+        staging / "Inception.2010.1080p.BluRay.x264-GRP.mkv", size=9000)
+    want = _movie_want(title="Inception", year=2010, source="tmdb", ext="27205")
+    did = _make_movie_download(want=want, staging=staging, files=[staged.name])
+    target = movies / "Inception (2010) {tmdb-27205}" / "Inception (2010).mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"different-library-file")
+    original = target.read_bytes()
+    # Simulate the history left by an earlier collision pass. This is a plan,
+    # not proof that Sensarr owns the destination file.
+    downloads_store.add_history(
+        did, "renamed", before=staged.name, after=target.name)
+    dm = _dm(monkeypatch)
+
+    out = dm._post_process(did)
+
+    assert out.startswith("processed (no move)")
+    assert target.read_bytes() == original
+    assert staged.is_file()
+
+
 # ---------------------------------------------------------------------------
 # Per-file movie naming — multipart, extras, samples
 # ---------------------------------------------------------------------------
@@ -409,8 +435,7 @@ def test_preexisting_foreign_smaller_file_never_overwritten(tmp_path, monkeypatc
 
 
 def test_own_interrupted_partial_is_still_repaired(tmp_path, monkeypatch):
-    """The 2026-07-10 interrupted-move repair survives the B1 fix when the
-    partial file is attributable to THIS download's own earlier pass."""
+    """An unclosed exact move audit can safely repair its own partial copy."""
     movies = tmp_path / "Movies"
     _movie_root(monkeypatch, movies)
     folder = movies / "Repair Me (2018) {tmdb-55}"
@@ -419,10 +444,13 @@ def test_own_interrupted_partial_is_still_repaired(tmp_path, monkeypatch):
     staged = _write(staging / "Repair.Me.2018.1080p.WEB.x264-GRP.mkv", size=9000)
     want = _movie_want(title="Repair Me", year=2018, source="tmdb", ext="55")
     did = _make_movie_download(want=want, staging=staging, files=[staged.name])
-    # The earlier (interrupted) pass recorded its rename intent.
-    downloads_store.add_history(did, "renamed",
-                                before=staged.name,
-                                after="Repair Me (2018).mkv")
+    # The earlier pass durably recorded the exact move immediately before it
+    # was interrupted. A planned rename alone is deliberately insufficient.
+    downloads_store.add_history(
+        did, "move_started", before=str(staged),
+        after=json.dumps({
+            "target": str(partial), "expected_size": staged.stat().st_size,
+        }, sort_keys=True))
     dm = _dm(monkeypatch)
 
     dm._post_process(did)

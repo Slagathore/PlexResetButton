@@ -595,14 +595,15 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if already_have:
             bullet_list = "\n".join(f"• {t}" for t in already_have)
             reply_parts.append(
-                f"📚 <b>Already in your library, nothing new queued ({len(already_have)}):</b>\n{bullet_list}"
+                f"📚 <b>Already owned or requested, nothing duplicated "
+                f"({len(already_have)}):</b>\n{bullet_list}"
             )
         if reply_parts:
             reply_parts.append("Use the <b>📝 Requests</b> button anytime to see the full queue.")
             await message.reply_html("\n\n".join(reply_parts))
         else:
             await message.reply_text(
-                "Nothing new to add. Everything was already in your library."
+                "Nothing new to add. Everything was already owned or already requested."
             )
 
         _clear_flow_state(context)
@@ -633,12 +634,13 @@ def _add_non_season_items(
         match = lr.best_match
         candidate_titles = [m.title for m in lr.external_matches]
         if match is not None:
-            _row, reused = request_intake.add_matched_request_reporting(
+            row, reused = request_intake.add_matched_request_reporting(
                 display, requester, media_type=media_type, match=match,
                 candidate_titles=candidate_titles,
             )
             if reused:
-                already_have.append(f"{display} is already in your library.")
+                already_have.append(
+                    request_intake.reused_request_message(row, display))
                 continue
         else:
             # No external match at all — visible needs_identity, not grabbed.
@@ -1018,11 +1020,14 @@ async def _apply_season_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         tag = "" if outcome.status != "needs_identity" else " (needs identity)"
         _record_season_added(context, f"{match.title}: {label}{tag}")
     if reused_ids:
-        reused_seasons = await loop.run_in_executor(
-            None, lambda: _seasons_for_ids(reused_ids))
-        season_txt = _format_season_ranges(reused_seasons) if reused_seasons else "that season"
-        _record_already_have(
-            context, f"{match.title} {season_txt} is already in your library.")
+        for request_id in sorted(reused_ids):
+            row = await loop.run_in_executor(
+                None, lambda rid=request_id: get_request(rid))
+            season = getattr(row, "season", None)
+            label = (f"{match.title} S{season:02d}"
+                     if season is not None else match.title)
+            _record_already_have(
+                context, request_intake.reused_request_message(row, label))
 
 
 def _seasons_for_ids(request_ids: set[int]) -> list[int]:
@@ -1338,14 +1343,15 @@ async def _apply_anime_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     candidate_titles = [m.title for m in lr.external_matches]
     display = lr.request.display()
     loop = asyncio.get_running_loop()
-    _row, reused = await loop.run_in_executor(
+    row, reused = await loop.run_in_executor(
         None,
         lambda: request_intake.add_matched_request_reporting(
             display, requester, media_type=media_type, match=match,
             candidate_titles=candidate_titles),
     )
     if reused:
-        _record_already_have(context, f"{display} is already in your library.")
+        _record_already_have(
+            context, request_intake.reused_request_message(row, display))
     else:
         _record_season_added(context, display)
 

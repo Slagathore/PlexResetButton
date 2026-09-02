@@ -106,7 +106,7 @@ TELEGRAM_ALLOWED_USER_IDS: tuple[int, ...] = _parse_id_list(
     os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
 )
 APP_PRODUCT_NAME: str = "Sensarr"
-APP_VERSION: str = "1.5.0"
+APP_VERSION: str = "1.6.0"
 
 # How long (seconds) to pause between each process-gone check after Exit is clicked.
 # Plex can take 10-30s to fully stop — 3s intervals × 10 retries = 30s total window.
@@ -430,6 +430,16 @@ TORRENT_AUTO_GRAB: bool = _env_bool("TORRENT_AUTO_GRAB", False)
 TORRENT_STALL_TIMEOUT_SECONDS: int = int(
     os.getenv("TORRENT_STALL_TIMEOUT_SECONDS", "900")
 )
+# Absolute wall-clock bound for one runner attempt. The stall timeout catches
+# zero progress; this catches a release that trickles forever at an unusable
+# rate. Its failure hash is then cooled down so the request tries another copy.
+TORRENT_MAX_RUNTIME_HOURS: float = float(
+    os.getenv("TORRENT_MAX_RUNTIME_HOURS", "8"))
+# One dead indexer should cost one timeout, not one timeout per request in the
+# same pass. After a provider/network failure its circuit remains open for this
+# many seconds, then a later search probes it again automatically.
+TORRENT_PROVIDER_BACKOFF_SECONDS: int = int(
+    os.getenv("TORRENT_PROVIDER_BACKOFF_SECONDS", "900"))
 # Built-in engine queue: at most this many downloads run at once; the rest
 # wait as 'queued'. 3-5 is the sweet spot — more just splits bandwidth and
 # stalls everything (the 22-at-once request burst proved it). qBittorrent
@@ -463,6 +473,9 @@ ZERO_SEEDER_RACE_WINDOW_MINUTES: int = int(
 # How long a "no seeded release available" deferral holds a request before the
 # open scan rechecks it (seeders can appear within hours).
 ZERO_SEEDER_DEFER_HOURS: float = float(os.getenv("ZERO_SEEDER_DEFER_HOURS", "6"))
+# A request with no acceptable candidate is held rather than re-running the
+# exact same searches every five minutes. Users can still choose Grab Now.
+NO_RESULT_DEFER_HOURS: float = float(os.getenv("NO_RESULT_DEFER_HOURS", "6"))
 # How many grabs for one request may reach a terminal failure (download
 # error/cancelled or a quarantined verify) before the request stops looping
 # through auto-grab and lands in needs_attention for a human to decide.

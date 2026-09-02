@@ -102,7 +102,10 @@ def request_rows() -> list[GrabQueueRow]:
         d = deferrals.get(f"req:{req.request_id}")
         title = req.resolved_title or req.content
         if req.season is not None:
-            title = f"{title} S{int(req.season):02d}"
+            # This is a human-facing target label, not the literal provider
+            # query.  Spelling it out prevents the queue from looking like it
+            # requires one narrowly-named ``Title S01`` season pack.
+            title = f"{title} — Season {int(req.season)}"
         common = dict(
             subject_key=_request_subject_key(req), display_title=title,
             state=req.status, request_id=req.request_id,

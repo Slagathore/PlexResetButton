@@ -227,6 +227,99 @@ def test_season_pack_rejects_wrong_country_edition(monkeypatch):
     assert run.chosen_infohash is None
 
 
+def test_max_and_ruby_pack_miss_enumerates_episodes(monkeypatch):
+    """Live regression: an explicit TVDB season is not a pack-only request.
+
+    The old worker repeatedly searched only ``Max & Ruby S01``, wrote a
+    request-wide pack deferral, and never populated/traversed the episode grid.
+    Prove the upgraded old hold is cleared, ``&``/``and`` are equivalent, E01's
+    miss does not poison E02/E03, and every chosen episode keeps request
+    provenance.
+    """
+    import maintenance
+    import media_identity
+
+    req = request_intake.add_matched_request(
+        "Max and ruby", "cole", media_type="tv",
+        match=_show(title="Max & Ruby", ext="71741", countries=()), season=1)
+    show = shows_store.get_show_by_identity("tvdb", "71741")
+    assert show is not None
+
+    class _Ep:
+        def __init__(self, episode):
+            self.season = 1
+            self.episode = episode
+            self.title = f"Episode {episode}"
+            self.air_date = f"2002-01-{episode:02d}"
+
+    shows_store.replace_episodes(show.show_id, [_Ep(1), _Ep(2), _Ep(3)])
+    downloads_store.set_grab_deferral(
+        f"req:{req.request_id}", wait_hours=6,
+        reason="no acceptable season pack found")
+    queue_store.set_status(req.request_id, queue_store.STATUS_DEFERRED)
+
+    queries = []
+
+    def search(query, media_type):
+        queries.append(query)
+        # Force the provider-query ampersand fallback. E01 deliberately has no
+        # release; E02 and E03 exist under the word "and" spelling.
+        if query.startswith("Max and Ruby ") and "S01E02" in query:
+            return _pool([_res(
+                "Max.and.Ruby.S01E02.1080p.WEB.x264-GRP", "max-e02",
+                size=400 * _MB, seeders=20, media_type="tv")])
+        if query.startswith("Max and Ruby ") and "S01E03" in query:
+            return _pool([_res(
+                "Max.and.Ruby.S01E03.1080p.WEB.x264-GRP", "max-e03",
+                size=400 * _MB, seeders=18, media_type="tv")])
+        return _pool([])
+
+    dm = _dm(monkeypatch, [])
+    monkeypatch.setattr("download_manager.search_collect", search)
+    monkeypatch.setattr(maintenance, "request_present_in_library",
+                        lambda _req: False)
+
+    started = dm.auto_grab_open_requests()
+
+    assert len(started) == 2
+    assert any(q == "Max & Ruby S01" for q in queries)
+    assert any(q == "Max & Ruby S01E01" for q in queries)
+    assert any(q == "Max and Ruby S01E01" for q in queries)
+    assert any(q == "Max and Ruby S01E02" for q in queries)
+    assert any(q == "Max and Ruby S01E03" for q in queries)
+    assert media_identity.normalize_title("Max & Ruby") == (
+        media_identity.normalize_title("Max and Ruby"))
+
+    grabbed = [downloads_store.get_download(download_id)
+               for download_id in started]
+    assert {(row.season, row.episode) for row in grabbed if row is not None} == {
+        (1, 2), (1, 3)}
+    assert all(row.request_id == req.request_id
+               for row in grabbed if row is not None)
+    assert downloads_store.get_grab_deferral(
+        f"ep:{show.show_id}:1:1") is not None
+    assert downloads_store.get_grab_deferral(f"req:{req.request_id}") is None
+
+
+def test_season_episode_sync_contention_does_not_defer_request(monkeypatch):
+    """A concurrent Shows pass is a five-minute retry, not a six-hour miss."""
+    import show_tracker
+
+    req = request_intake.add_matched_request(
+        "Busy Show", "cole", media_type="tv",
+        match=_show(title="Busy Show", ext="busy-1", countries=()), season=1)
+    dm = _dm(monkeypatch, [])
+    monkeypatch.setattr(
+        show_tracker, "sync_show",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            show_tracker.ShowsBusyError("another Shows pass owns the lock")))
+
+    assert dm._grab_request_seasonwise(req) == []
+    refreshed = queue_store.get_request(req.request_id)
+    assert refreshed is not None and refreshed.status == queue_store.STATUS_OPEN
+    assert downloads_store.get_grab_deferral(f"req:{req.request_id}") is None
+
+
 # ---------------------------------------------------------------------------
 # Path 3 — episodes: _grab_one_episode (automatic-episode + request linkage)
 # ---------------------------------------------------------------------------

@@ -1024,11 +1024,20 @@ def get_anime_airing(title: str, *, explicit: bool = False) -> tuple["EpisodeInf
 # ---------------------------------------------------------------------------
 
 _EP_PATTERNS = [
-    re.compile(r"\s*[-–]\s*S\d{2}E\d{2}\b.*", re.IGNORECASE),
-    re.compile(r"\s*[-–]\s*\d+x\d+\b.*", re.IGNORECASE),
+    re.compile(r"[\s._\-–]+S\d{1,2}E\d{1,3}\b.*", re.IGNORECASE),
+    re.compile(r"[\s._\-–]+\d{1,2}x\d{1,3}\b.*", re.IGNORECASE),
     re.compile(r"\s*\(\d{4}\).*"),
     re.compile(r"\s*\.\w{2,4}$"),
 ]
+
+_STRUCTURAL_SEASON_SUFFIX_RE = re.compile(
+    r"(?:[\s._\-–]+)(?:season[\s._\-]*0*(\d{1,2})|s0*(\d{1,2}))\s*$",
+    re.IGNORECASE)
+_SEASON_IN_FILE_RES = (
+    re.compile(r"(?:^|\D)S(\d{1,2})E\d{1,3}(?:\D|$)", re.IGNORECASE),
+    re.compile(r"(?:^|\D)(\d{1,2})x\d{1,3}(?:\D|$)", re.IGNORECASE),
+    re.compile(r"(?:^|\D)Season[\s._\-]*0*(\d{1,2})(?:\D|$)", re.IGNORECASE),
+)
 
 _FUZZY_LIBRARY_THRESHOLD = 0.75
 
@@ -1047,6 +1056,30 @@ def clean_library_name(name: str) -> str:
     for pat in _EP_PATTERNS:
         result = pat.sub("", result)
     return result.strip().casefold()
+
+
+def split_structural_season(title: str) -> tuple[str, int | None]:
+    """Separate a user search suffix (``Season 01``/``S01``) from the show.
+
+    The season is matching structure, not part of the canonical title and not
+    a sequel number. Episode markers such as S01E01 are deliberately not
+    accepted as suffixes here.
+    """
+    match = _STRUCTURAL_SEASON_SUFFIX_RE.search(title or "")
+    if not match:
+        return (title or "").strip(), None
+    season = int(match.group(1) or match.group(2))
+    base = (title[:match.start()] or "").strip(" ._-–")
+    return (base or title.strip()), season
+
+
+def _season_from_library_entry(entry) -> int | None:
+    text = f"{getattr(entry, 'name', '')} {getattr(entry, 'path', '')}"
+    for pattern in _SEASON_IN_FILE_RES:
+        match = pattern.search(text)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def _word_fallback_search(title: str) -> list:
@@ -1099,25 +1132,34 @@ def check_library_for_title(
             word-fallback hacks, since those produce false positives like
             "Reacher 2" matching unrelated entries returned by Plex search.
     """
+    query_title, wanted_season = (
+        split_structural_season(title)
+        if media_type in ("tv", "show") else (title, None))
     try:
         from library_index import search_library
-        results = search_library(title, limit=10)
+        results = search_library(query_title, limit=10)
     except Exception as exc:
         logger.warning("Library search failed for '%s': %s", title, exc)
         return False, []
 
     # Word-by-word fallback only in fuzzy mode — strict mode doesn't want it.
     if not results and not strict:
-        results = _word_fallback_search(title)
+        results = _word_fallback_search(query_title)
 
     if not results:
         return False, []
 
-    title_lower = title.casefold()
+    title_lower = query_title.casefold()
     threshold = 0.92 if strict else _FUZZY_LIBRARY_THRESHOLD
 
     matched: list[str] = []
     for entry in results:
+        if (wanted_season is not None
+                and _season_from_library_entry(entry) != wanted_season):
+            # A show-level folder proves the show exists, not that this season
+            # exists. Require an actual matching season marker from the indexed
+            # path/name before claiming a season-specific request is owned.
+            continue
         cleaned = clean_library_name(entry.name)
         if not cleaned:
             continue
@@ -1190,34 +1232,53 @@ def lookup_media(request: ParsedRequest, media_type: str) -> LookupResult:
         request:    Parsed user request (title + optional year/qualifier).
         media_type: "movie" | "tv" | "anime" | "xanime"
     """
-    in_library, library_matches = check_library_for_title(request.title, media_type)
+    lookup_request = request
+    lookup_title = request.title
+    requested_season = None
+    if media_type == "tv":
+        lookup_title, requested_season = split_structural_season(request.title)
+        if lookup_title != request.title:
+            from dataclasses import replace
+            lookup_request = replace(
+                request, title=lookup_title,
+                qualifier=request.qualifier or f"Season {requested_season}")
+
+    found_title, library_matches = check_library_for_title(
+        request.title if requested_season is not None else lookup_title,
+        media_type)
+    # A show-level title hit does not mean an unspecified season request is
+    # fulfilled. It must still reach the season picker. An explicitly named
+    # season may be called owned only when check_library_for_title found that
+    # season in an indexed filename/path.
+    in_library = found_title if requested_season is not None else (
+        False if media_type == "tv" else found_title)
 
     external_matches: list[MediaResult] = []
     search_attempted = False
 
-    if not in_library:
+    if not in_library or media_type == "tv":
         if media_type == "movie":
             if _tmdb_enabled():
                 search_attempted = True
-            external_matches = search_tmdb_movies(request.title, request.year)
+            external_matches = search_tmdb_movies(lookup_title, request.year)
 
         elif media_type == "tv":
             # TVDB is primary for shows; TMDB is the fallback
             if config.TVDB_API_KEY or _tmdb_enabled():
                 search_attempted = True
-            external_matches = search_tvdb_shows(request.title, request.year)
+            external_matches = search_tvdb_shows(lookup_title, request.year)
             if not external_matches:
-                external_matches = search_tmdb_shows(request.title, request.year)
+                external_matches = search_tmdb_shows(lookup_title, request.year)
 
         elif media_type == "anime":
             search_attempted = True  # Jikan requires no API key
-            external_matches = search_jikan_anime(request.title, explicit=False)
+            external_matches = search_jikan_anime(lookup_title, explicit=False)
 
         elif media_type == "xanime":
             search_attempted = True  # AniDB + Jikan require no API key
-            external_matches = search_anidb(request.title)
+            external_matches = search_anidb(lookup_title)
             if not external_matches:
-                external_matches = search_jikan_anime(request.title, explicit=True)
+                external_matches = search_jikan_anime(lookup_title, explicit=True)
 
     # Attach the user's qualifier (e.g. "[Season 2]") to the best match
     best = external_matches[0] if external_matches else None
@@ -1234,7 +1295,7 @@ def lookup_media(request: ParsedRequest, media_type: str) -> LookupResult:
         )
 
     return LookupResult(
-        request=request,
+        request=lookup_request,
         in_library=in_library,
         library_matches=library_matches,
         external_matches=external_matches,

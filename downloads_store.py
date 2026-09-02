@@ -778,6 +778,8 @@ def display_status(status: str, progress: float, *, error: str | None = None,
         return "waiting for slot"
     if status == "error" and (error or "").lower().startswith("stalled"):
         return "stalled"
+    if status == "downloaded" and error:
+        return "needs import"
     if status == "downloading":
         if phase == "fetching_metadata":
             return "fetching metadata"
@@ -826,6 +828,29 @@ def list_downloads(*, limit: int = 100,
             (limit,),
         ).fetchall()
     return [_row_to_download(r) for r in rows]
+
+
+def list_downloads_by_status(statuses: tuple[str, ...] | list[str], *,
+                             include_removed: bool = False) -> list[DownloadRow]:
+    """Return every row in the requested states, without a newest-N cutoff.
+
+    Recovery and queue pumping are correctness paths: an old queued/downloaded
+    row must not become immortal merely because 300 newer history rows exist.
+    Values are SQL parameters; only the placeholder count is interpolated.
+    """
+    wanted = tuple(str(status) for status in statuses if str(status))
+    if not wanted:
+        return []
+    initialize_downloads_db()
+    placeholders = ",".join("?" for _ in wanted)
+    removed_clause = "" if include_removed else " AND removed_at IS NULL"
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_DOWNLOAD_COLUMNS} FROM downloads "
+            f"WHERE status IN ({placeholders}){removed_clause} ORDER BY id",
+            wanted,
+        ).fetchall()
+    return [_row_to_download(row) for row in rows]
 
 
 def request_ids_with_downloads() -> set[int]:

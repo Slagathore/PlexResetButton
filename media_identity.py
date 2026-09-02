@@ -73,13 +73,15 @@ def spell_to_digits(text: str) -> str:
 
 def normalize_title(title: str | None) -> str:
     """Lowercase, strip punctuation to spaces, canonicalise spelled numbers to
-    digits, collapse whitespace.
+    digits, collapse whitespace.  An ampersand is a word, not disposable
+    punctuation: canonicalise ``&`` to ``and`` so provider/library variants
+    such as ``Max & Ruby`` and ``Max and Ruby`` share one identity.
 
     Deliberately dependency-free (does not lean on RTN.normalize_title) so this
     module stays importable with the minimal CI dep set. RTN's own normaliser
     is used by the selection layer on top of this, not instead of it.
     """
-    text = (title or "").casefold()
+    text = (title or "").casefold().replace("&", " and ")
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = spell_to_digits(text)
     return " ".join(text.split())
@@ -149,12 +151,14 @@ def sequel_signature(title: str) -> frozenset[int]:
     """
     numbers: set[int] = set()
     prev = ""
+    structural_markers = {"season", "series", "episode", "ep", "volume", "vol"}
     for tok in _signature_portion(title):
         if tok.isdigit():
             value = int(tok)
-            if not (1880 <= value <= 2159 and len(tok) == 4):  # skip years
+            if (prev not in structural_markers
+                    and not (1880 <= value <= 2159 and len(tok) == 4)):
                 numbers.add(value)
-        elif tok in _ROMAN_NUMERALS:
+        elif tok in _ROMAN_NUMERALS and prev not in structural_markers:
             numbers.add(_ROMAN_NUMERALS[tok])
         elif tok in _NUMBER_WORDS and prev in _PART_MARKERS:
             numbers.add(_NUMBER_WORDS[tok])

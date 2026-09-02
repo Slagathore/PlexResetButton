@@ -198,8 +198,12 @@ def test_samples_and_extras_never_reach_library_root(tmp_path, monkeypatch):
     assert rows["sample.mkv"].verification_state == "skipped"
     assert "never moves to a library root" in (
         rows["sample.mkv"].verification_reason or "")
-    assert rows["Behind.The.Scenes.mkv"].media_role == "extra"
-    assert rows["Behind.The.Scenes.mkv"].verification_state == "skipped"
+    extra_row = next(
+        row for relative, row in rows.items()
+        if relative and relative.endswith("Behind.The.Scenes.mkv"))
+    assert "Extras" in (extra_row.source_relative_path or "")
+    assert extra_row.media_role == "extra"
+    assert extra_row.verification_state == "skipped"
 
 
 def test_no_gating_video_moves_nothing(tmp_path, monkeypatch):

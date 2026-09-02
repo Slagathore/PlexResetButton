@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -17,6 +18,33 @@ _LOG_SEQ = 0
 _LOG_FILE_NAME = "sensarr.log"
 _LOG_FILE_MAX_BYTES = 2 * 1024 * 1024  # ~2 MB
 _LOG_FILE_BACKUP_COUNT = 2
+
+_SECRET_PATTERNS = (
+    # python-telegram-bot/httpx logs the complete Bot API URL at INFO unless
+    # filtered; the path itself contains the bot credential.
+    (re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE),
+     r"\1<redacted>"),
+    (re.compile(r"([?&](?:api_key|token|X-Plex-Token)=)[^&\s]+",
+                re.IGNORECASE), r"\1<redacted>"),
+    (re.compile(r"(Authorization:\s*(?:Bearer|Basic)\s+)[^\s]+",
+                re.IGNORECASE), r"\1<redacted>"),
+)
+
+
+def redact_log_text(text: str) -> str:
+    redacted = str(text)
+    for pattern, replacement in _SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+class SecretRedactionFilter(logging.Filter):
+    """Redact credentials before any stream, memory, or disk formatter runs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_log_text(record.getMessage())
+        record.args = ()
+        return True
 
 
 class InMemoryLogHandler(logging.Handler):
@@ -49,13 +77,16 @@ def configure_logging() -> None:
 
     root_logger.setLevel(logging.INFO)
     formatter = logging.Formatter(_LOG_FORMAT)
+    secret_filter = SecretRedactionFilter()
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
+    stream_handler.addFilter(secret_filter)
     root_logger.addHandler(stream_handler)
 
     memory_handler = InMemoryLogHandler()
     memory_handler.setFormatter(formatter)
+    memory_handler.addFilter(secret_filter)
     root_logger.addHandler(memory_handler)
 
     # app_paths is imported lazily here (not at module level) — app_paths
@@ -72,11 +103,18 @@ def configure_logging() -> None:
             backupCount=_LOG_FILE_BACKUP_COUNT, encoding="utf-8")
         file_handler.setFormatter(formatter)
         file_handler.setLevel(logging.INFO)
+        file_handler.addFilter(secret_filter)
         root_logger.addHandler(file_handler)
     except Exception:
         root_logger.warning(
             "Could not set up the rotating log file (%s) — continuing with "
             "the in-memory/stream logs only.", _LOG_FILE_NAME, exc_info=True)
+
+    # These libraries otherwise emit complete request URLs. Application-level
+    # warnings/errors remain visible, while routine successful HTTP chatter no
+    # longer duplicates sensitive endpoints into three rotating log files.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     _LOGGING_CONFIGURED = True
 

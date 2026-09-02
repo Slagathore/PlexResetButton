@@ -186,9 +186,10 @@ class WatchlistTab:
 
     # JSON, not pickle (Task S item 1): the cache dir is user-writable and
     # the app runs elevated — a cache file must never be able to run code.
-    # Bumped to 2 for the library/discover split + freshness stamp (fix
-    # sprint, Task C) — a v1 cache is a clean miss, never misread.
-    _RECS_CACHE_VERSION = 2
+    # v3 invalidates caches that may have been overwritten by a genre-filtered
+    # fetch. Filtered views are no longer persisted as the canonical "All"
+    # recommendation set.
+    _RECS_CACHE_VERSION = 3
 
     def _recs_cache_path(self):
         import app_paths
@@ -362,7 +363,11 @@ class WatchlistTab:
                                                   if g not in result.top_genres]
                     self._genre_combo.configure(values=["All"] + merged)
                 self._render_recs()
-                self._persist_recs()
+                # A filtered fetch is a view, not the canonical warm-start
+                # cache. Persisting "Adventure" over "All" made the next app
+                # launch look as if most recommendation selections were empty.
+                if genre in ("", "All"):
+                    self._persist_recs()
                 restore()
                 self.app.post_activity(
                     "Watchlist",

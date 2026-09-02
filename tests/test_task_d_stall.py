@@ -141,13 +141,12 @@ def test_display_status_labels(status, progress, error, phase, expected):
 # no stop flag.
 # ---------------------------------------------------------------------------
 
-def test_rotate_cooldown_popped_once_row_leaves_downloading(monkeypatch):
-    """A row that rotates back to 'queued' (not yet at DOWNLOAD_MAX_ROTATIONS)
-    must still have its _rotate_cooldown entry cleared once the monitor next
-    sees it out of 'downloading' — the same lifecycle _progress_seen and
-    _rotation_count already had. Before the fix, only the stall-to-error
-    branch ever popped _rotate_cooldown, so a row that rotated and then later
-    succeeded/errored/cancelled leaked its entry for the rest of the process."""
+def test_rotate_cooldown_survives_queue_wait_then_clears_at_terminal(monkeypatch):
+    """Rotation state belongs to a queued retry until it finishes.
+
+    Clearing it on the downloading-to-queued transition made every retry look
+    like rotation zero, so DOWNLOAD_MAX_ROTATIONS could never end the loop.
+    """
     monkeypatch.setattr(config, "DOWNLOAD_MAX_ROTATIONS", 5)
     dm = DownloadManager()
     monkeypatch.setattr(dm, "_maybe_start_next", lambda: None)
@@ -168,11 +167,16 @@ def test_rotate_cooldown_popped_once_row_leaves_downloading(monkeypatch):
     assert downloads_store.get_download(did).status == "queued"
     assert did in dm._rotate_cooldown
 
-    # Second pass: the row is no longer 'downloading'. All three bookkeeping
-    # dicts must drop it, not just _progress_seen/_rotation_count.
+    # Second pass: queued is still part of the retry lifecycle.
+    dm._queue_monitor_pass()
+    assert did in dm._rotate_cooldown
+    assert did not in dm._progress_seen
+    assert dm._rotation_count[did] == 1
+
+    # Once terminal, the next monitor pass drops all in-memory bookkeeping.
+    downloads_store.set_status(did, "moved", completed=True)
     dm._queue_monitor_pass()
     assert did not in dm._rotate_cooldown
-    assert did not in dm._progress_seen
     assert did not in dm._rotation_count
 
 

@@ -223,7 +223,10 @@ def parse_torrent_name(name: str) -> ParsedName:
 # --- Show folder matching ----------------------------------------------------
 
 def _norm(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+    # Match the identity layer's treatment of ampersands.  Release names often
+    # spell ``&`` as ``and`` (or vice versa); that is not a different show.
+    return re.sub(
+        r"[^a-z0-9]+", " ", text.casefold().replace("&", " and ")).strip()
 
 
 def _folder_similarity(a: str, b: str) -> float:

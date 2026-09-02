@@ -19,16 +19,67 @@
 import json
 import logging
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
+import config
+
 logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 15
 _USER_AGENT = "Sensarr/1.0"
+
+_PROVIDER_LOCK = threading.Lock()
+_PROVIDER_FAILURE_UNTIL: dict[str, float] = {}
+_PROVIDER_LAST_ERROR: dict[str, str] = {}
+
+
+def _provider_available(provider: str) -> bool:
+    """Whether a provider's failure circuit currently permits a probe."""
+    now = time.monotonic()
+    with _PROVIDER_LOCK:
+        until = _PROVIDER_FAILURE_UNTIL.get(provider, 0.0)
+        if until <= now:
+            _PROVIDER_FAILURE_UNTIL.pop(provider, None)
+            return True
+        return False
+
+
+def _record_provider_failure(provider: str, exc: Exception) -> None:
+    until = time.monotonic() + max(
+        1, int(config.TORRENT_PROVIDER_BACKOFF_SECONDS))
+    with _PROVIDER_LOCK:
+        _PROVIDER_FAILURE_UNTIL[provider] = until
+        _PROVIDER_LAST_ERROR[provider] = str(exc)
+    logger.warning(
+        "%s search provider failed; pausing it for %ss: %s",
+        provider.upper(), config.TORRENT_PROVIDER_BACKOFF_SECONDS, exc)
+
+
+def _record_provider_success(provider: str) -> None:
+    with _PROVIDER_LOCK:
+        _PROVIDER_FAILURE_UNTIL.pop(provider, None)
+        _PROVIDER_LAST_ERROR.pop(provider, None)
+
+
+def provider_circuit_status(providers: list[str] | tuple[str, ...]) -> dict[str, dict]:
+    """Read-only circuit detail included in selection provenance."""
+    now = time.monotonic()
+    with _PROVIDER_LOCK:
+        return {
+            provider: {
+                "available": _PROVIDER_FAILURE_UNTIL.get(provider, 0.0) <= now,
+                "retry_in_seconds": max(
+                    0, round(_PROVIDER_FAILURE_UNTIL.get(provider, 0.0) - now)),
+                "last_error": _PROVIDER_LAST_ERROR.get(provider),
+            }
+            for provider in providers
+        }
 
 # Standard open trackers appended to magnets built from a bare info-hash.
 _TRACKERS = [
@@ -77,6 +128,9 @@ def _infohash(magnet: str) -> str:
 # ---------------------------------------------------------------------------
 
 def search_yts(query: str, *, limit: int = 20) -> list[TorrentResult]:
+    if not _provider_available("yts"):
+        logger.debug("YTS circuit open; skipping search for %r.", query)
+        return []
     url = (
         "https://yts.mx/api/v2/list_movies.json?"
         + urllib.parse.urlencode({"query_term": query, "limit": limit, "sort_by": "seeds"})
@@ -84,8 +138,9 @@ def search_yts(query: str, *, limit: int = 20) -> list[TorrentResult]:
     try:
         payload = json.loads(_http_get(url))
     except Exception as exc:
-        logger.warning("YTS search failed for %r: %s", query, exc)
+        _record_provider_failure("yts", exc)
         return []
+    _record_provider_success("yts")
 
     results: list[TorrentResult] = []
     for movie in (payload.get("data", {}).get("movies") or []):
@@ -114,14 +169,18 @@ def search_yts(query: str, *, limit: int = 20) -> list[TorrentResult]:
 
 def search_tpb(query: str, media_type: str, *, limit: int = 30,
                collect: bool = False) -> list[TorrentResult]:
+    if not _provider_available("tpb"):
+        logger.debug("TPB circuit open; skipping search for %r.", query)
+        return []
     # cat=200 restricts to Video. (Categories: 201 movies, 205 TV, 207 HD
     # movies, 208 HD TV — 200 covers the whole video tree.)
     url = "https://apibay.org/q.php?" + urllib.parse.urlencode({"q": query, "cat": "200"})
     try:
         payload = json.loads(_http_get(url))
     except Exception as exc:
-        logger.warning("TPB (apibay) search failed for %r: %s", query, exc)
+        _record_provider_failure("tpb", exc)
         return []
+    _record_provider_success("tpb")
 
     results: list[TorrentResult] = []
     for item in payload if isinstance(payload, list) else []:
@@ -166,6 +225,9 @@ def _parse_nyaa_size(text: str) -> int:
 def _search_nyaa_rss(base: str, query: str, category: str, source: str,
                      media_type: str, *, limit: int = 30,
                      collect: bool = False) -> list[TorrentResult]:
+    if not _provider_available(source):
+        logger.debug("%s circuit open; skipping search for %r.", source, query)
+        return []
     # RSS is sorted by seeders desc server-side. In collection mode we still
     # only BOUND the pool (take the first `limit`); the point is that `limit` is
     # the wide per-source pool, not a narrow final cut, and the selection gates —
@@ -176,8 +238,9 @@ def _search_nyaa_rss(base: str, query: str, category: str, source: str,
     try:
         root = ET.fromstring(_http_get(url))
     except Exception as exc:
-        logger.warning("%s search failed for %r: %s", source, query, exc)
+        _record_provider_failure(source, exc)
         return []
+    _record_provider_success(source)
 
     results: list[TorrentResult] = []
     for item in root.iter("item"):
@@ -307,6 +370,8 @@ def search_collect(query: str, media_type: str, *,
 
     stats = {
         "per_source": per_source_stats,
+        "provider_health": provider_circuit_status(
+            tuple(source for source, _results in per_source_results)),
         "collected": len(collected),
         "deduped": len(deduped),
         "duplicates_removed": len(collected) - len(deduped),

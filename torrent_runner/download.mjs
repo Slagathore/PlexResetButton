@@ -1,7 +1,7 @@
 // =============================================================================
 // download.mjs — headless webtorrent downloader for Sensarr
 // =============================================================================
-// Usage: node download.mjs <magnet-uri> <destination-dir> [stallTimeoutSec]
+// Usage: node download.mjs <magnet-uri> <destination-dir> [stallTimeoutSec] [selectionJson]
 //
 // Protocol: newline-delimited JSON on stdout, consumed by download_manager.py:
 //   {"event":"metadata","name":...,"files":[{"path":...,"size":...}]}
@@ -19,7 +19,7 @@
 
 import WebTorrent from "webtorrent";
 
-const [magnet, destDir, stallTimeoutArg] = process.argv.slice(2);
+const [magnet, destDir, stallTimeoutArg, selectionArg] = process.argv.slice(2);
 
 // Deterministic no-network smoke mode (Task H item 9): prove the runner's
 // dependency tree loads and a client constructs/destroys cleanly, with every
@@ -45,6 +45,12 @@ if (!magnet || !destDir) {
   process.exit(2);
 }
 const STALL_MS = (parseInt(stallTimeoutArg, 10) || 900) * 1000;
+let selection = {};
+try {
+  selection = selectionArg ? JSON.parse(selectionArg) : {};
+} catch {
+  selection = {};
+}
 
 const emit = (obj) => console.log(JSON.stringify(obj));
 
@@ -65,6 +71,8 @@ client.on("error", (err) => {
 
 let lastDownloaded = 0;
 let lastActivity = Date.now();
+const startedAt = Date.now();
+let wantedFiles = [];
 
 const torrent = client.add(magnet, { path: destDir });
 
@@ -73,17 +81,105 @@ torrent.on("error", (err) => {
   die(1);
 });
 
-torrent.on("metadata", () => {
+const extension = (filePath) => {
+  const match = String(filePath || "").toLowerCase().match(/(\.[^.\\/]+)$/);
+  return match ? match[1] : "";
+};
+
+const pathTokens = (filePath) => new Set(
+  String(filePath || "").toLowerCase()
+    .split(/[\\/\s._\-\[\](){}]+/)
+    .filter(Boolean)
+);
+
+const episodeMarker = (filePath) => {
+  const text = String(filePath || "");
+  let match = text.match(/(?:^|\D)s(\d{1,2})[ ._\-]*e(\d{1,3})(?:\D|$)/i);
+  if (match) return { season: Number(match[1]), episode: Number(match[2]) };
+  match = text.match(/(?:^|\D)(\d{1,2})x(\d{1,3})(?:\D|$)/i);
+  return match ? { season: Number(match[1]), episode: Number(match[2]) } : null;
+};
+
+const subtitleLanguageOk = (filePath) => {
+  const spec = selection.subtitleLanguage || {};
+  const tokens = pathTokens(filePath);
+  const all = new Set(spec.allLanguageTokens || []);
+  const wanted = new Set(spec.wantedTokens || []);
+  const found = [...tokens].filter((token) => all.has(token));
+  return found.length === 0 || found.some((token) => wanted.has(token));
+};
+
+const chooseFiles = () => {
+  const videoExts = new Set(selection.videoExtensions || []);
+  const subtitleExts = new Set(selection.subtitleExtensions || []);
+  const videos = torrent.files.filter((file) => videoExts.has(extension(file.path)));
+  const wantedSeason = Number.isInteger(selection.season) ? selection.season : null;
+  const wantedEpisode = Number.isInteger(selection.episode) ? selection.episode : null;
+
+  let selectedVideos = videos;
+  if (wantedEpisode !== null) {
+    const exact = videos.filter((file) => {
+      const marker = episodeMarker(file.path);
+      return marker && marker.episode === wantedEpisode
+        && (wantedSeason === null || marker.season === wantedSeason);
+    });
+    // Never guess: prune a pack only after positively finding the target.
+    if (exact.length > 0) selectedVideos = exact;
+  } else if (wantedSeason !== null) {
+    const exactSeason = videos.filter((file) => {
+      const marker = episodeMarker(file.path);
+      return marker && marker.season === wantedSeason;
+    });
+    if (exactSeason.length > 0) selectedVideos = exactSeason;
+  }
+
+  const selected = new Set(selectedVideos);
+  for (const file of torrent.files) {
+    if (!subtitleExts.has(extension(file.path)) || !subtitleLanguageOk(file.path)) continue;
+    const marker = episodeMarker(file.path);
+    if (wantedEpisode !== null && marker
+        && (marker.episode !== wantedEpisode
+            || (wantedSeason !== null && marker.season !== wantedSeason))) continue;
+    if (wantedEpisode === null && wantedSeason !== null && marker
+        && marker.season !== wantedSeason) continue;
+    selected.add(file);
+  }
+
+  torrent.files.forEach((file) => file.deselect());
+  selected.forEach((file) => file.select());
+  return [...selected];
+};
+
+torrent.on("ready", () => {
   lastActivity = Date.now();
+  const selectedFiles = chooseFiles();
+  wantedFiles = selectedFiles;
+  const videoExts = new Set(selection.videoExtensions || []);
+  if (!selectedFiles.some((file) => videoExts.has(extension(file.path)))) {
+    emit({ event: "error", message: "torrent metadata contains no selectable video file" });
+    die(1);
+    return;
+  }
   emit({
     event: "metadata",
     name: torrent.name,
-    files: torrent.files.map((f) => ({ path: f.path, size: f.length })),
+    files: selectedFiles.map((f) => ({ path: f.path, size: f.length })),
+    skippedFiles: torrent.files.length - selectedFiles.length,
   });
 });
 
 const progressTimer = setInterval(() => {
   if (finished) return;
+  const maxRuntimeMs = Number(selection.maxRuntimeSeconds || 0) * 1000;
+  if (maxRuntimeMs > 0 && Date.now() - startedAt > maxRuntimeMs) {
+    emit({
+      event: "error",
+      message: `timed out: exceeded maximum runtime of ${selection.maxRuntimeSeconds}s`,
+    });
+    clearInterval(progressTimer);
+    die(1);
+    return;
+  }
   if (torrent.downloaded > lastDownloaded) {
     lastDownloaded = torrent.downloaded;
     lastActivity = Date.now();
@@ -106,7 +202,7 @@ torrent.on("done", () => {
   emit({
     event: "done",
     name: torrent.name,
-    files: torrent.files.map((f) => ({ path: f.path, size: f.length })),
+    files: wantedFiles.map((f) => ({ path: f.path, size: f.length })),
   });
   die(0); // destroy immediately — stops seeding
 });

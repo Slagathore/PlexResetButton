@@ -320,6 +320,47 @@ def test_discover_candidate_tagged_anime_by_language_and_genre(monkeypatch):
     assert out[0].item_type == "anime"
 
 
+def test_english_animation_stays_in_movie_bucket(monkeypatch):
+    now = 1_700_000_000.0
+    history = _seed_history(now, ["Seed A", "Seed B", "Seed C"])
+    monkeypatch.setattr(plex_api, "_seed_provider_id", lambda rk: ("tmdb", rk))
+    monkeypatch.setattr(
+        plex_api, "_tmdb_related",
+        lambda kind, ident: ([{
+            "id": "2", "title": "Western Animation", "vote_average": 8.0,
+            "vote_count": 100, "original_language": "en", "genre_ids": [16],
+        }] if ident == "0" else []),
+    )
+
+    out = _discover_from_history(
+        history, watched_titles=set(), provider_index=LibraryProviderIndex(),
+        requested_keys=set(), limit=10, now=now)
+
+    assert out[0].item_type == "movie"
+    assert "Animation" in out[0].genres
+
+
+def test_history_discovery_honors_selected_genre(monkeypatch):
+    now = 1_700_000_000.0
+    history = _seed_history(now, ["Seed A", "Seed B", "Seed C"])
+    monkeypatch.setattr(plex_api, "_seed_provider_id", lambda rk: ("tmdb", rk))
+    monkeypatch.setattr(
+        plex_api, "_tmdb_related",
+        lambda kind, ident: ([
+            {"id": "10", "title": "Action Pick", "vote_average": 7.0,
+             "vote_count": 100, "genre_ids": [28]},
+            {"id": "11", "title": "Romance Pick", "vote_average": 9.0,
+             "vote_count": 1000, "genre_ids": [10749]},
+        ] if ident == "0" else []),
+    )
+
+    out = _discover_from_history(
+        history, watched_titles=set(), provider_index=LibraryProviderIndex(),
+        requested_keys=set(), limit=10, now=now, genre_filter="Action")
+
+    assert [item.title for item in out] == ["Action Pick"]
+
+
 # ---------------------------------------------------------------------------
 # get_recommendations — the full two-section orchestration
 # ---------------------------------------------------------------------------

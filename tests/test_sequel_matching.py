@@ -58,9 +58,9 @@ def test_title_that_is_a_year_survives():
 
 
 class _Entry:
-    def __init__(self, name):
+    def __init__(self, name, path=None):
         self.name = name
-        self.path = f"D:/x/{name}.mkv"
+        self.path = path or f"D:/x/{name}.mkv"
 
 
 def test_library_check_rejects_sequel_false_positive(monkeypatch):
@@ -90,3 +90,49 @@ def test_library_check_matches_typo(monkeypatch):
     )
     found, _ = check_library_for_title("Severence", "tv")
     assert found
+
+
+def test_season_number_is_structure_not_a_sequel_number():
+    assert _sequel_signature("Silo Season 01") == frozenset()
+    assert not _sequel_mismatch("Silo Season 01", "Silo")
+
+
+def test_season_specific_library_check_uses_base_title_and_episode_path(monkeypatch):
+    queries = []
+
+    def search(query, limit=10):
+        queries.append(query)
+        return [_Entry("Silo - S01E01", "D:/TV/Silo/Season 01/Silo - S01E01.mkv")]
+
+    monkeypatch.setattr("library_index.search_library", search)
+    found, matches = check_library_for_title("Silo Season 01", "tv", strict=True)
+    assert found
+    assert matches == ["Silo - S01E01"]
+    assert queries == ["Silo"]
+
+
+def test_season_specific_library_check_rejects_other_season(monkeypatch):
+    monkeypatch.setattr(
+        "library_index.search_library",
+        lambda query, limit=10: [
+            _Entry("Silo - S02E01", "D:/TV/Silo/Season 02/Silo - S02E01.mkv")],
+    )
+    found, matches = check_library_for_title("Silo Season 01", "tv", strict=True)
+    assert not found
+    assert matches == []
+
+
+def test_generic_tv_title_hit_still_reaches_external_identity_picker(monkeypatch):
+    request = media_lookup.ParsedRequest(
+        original="Silo", title="Silo", year=None, qualifier=None)
+    monkeypatch.setattr(
+        media_lookup, "check_library_for_title", lambda *a, **k: (True, ["Silo"]))
+    match = media_lookup.MediaResult(
+        title="Silo", year=2023, external_id="123", external_url="u",
+        media_type="tv", overview="", source="tmdb")
+    monkeypatch.setattr(media_lookup, "search_tvdb_shows", lambda *a, **k: [match])
+
+    result = media_lookup.lookup_media(request, "tv")
+
+    assert result.in_library is False
+    assert result.best_match is match

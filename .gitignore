@@ -14,6 +14,7 @@
 debug_*.png
 # Log files may contain token fragments or personal file paths
 *.log
+*.log.*
 pyinstaller_check.log
 
 # -----------------------------------------------------------------------

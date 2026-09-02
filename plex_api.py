@@ -761,18 +761,51 @@ def _discover_candidate_to_recommendation(
     title = str(item.get("title") or item.get("name") or "")
     date_field = item.get("release_date") or item.get("first_air_date")
     year = (_safe_int(str(date_field)[:4]) or None) if date_field else None
+    genre_ids = [int(value) for value in (item.get("genre_ids") or [])
+                 if str(value).isdigit()]
+    # Animation alone is not anime (Pixar/Disney were disappearing from the
+    # movie/show filters). Require both Japanese original language and TMDB's
+    # Animation genre for the dedicated anime bucket.
     is_anime = (str(item.get("original_language") or "") == "ja"
-               or 16 in (item.get("genre_ids") or []))
+                and 16 in genre_ids)
     item_type = "anime" if is_anime else media_kind
     return Recommendation(
-        title=title, year=year, item_type=item_type, genres=(),
+        title=title, year=year, item_type=item_type,
+        genres=_tmdb_genre_names(genre_ids),
         note=note, in_library=False, tmdb_id=str(item.get("id") or "") or None)
+
+
+def _tmdb_genre_names(genre_ids: list[int]) -> tuple[str, ...]:
+    names = {
+        12: "Adventure", 14: "Fantasy", 16: "Animation", 18: "Drama",
+        27: "Horror", 28: "Action", 35: "Comedy", 36: "History",
+        37: "Western", 53: "Thriller", 80: "Crime", 99: "Documentary",
+        878: "Science Fiction", 9648: "Mystery", 10402: "Music",
+        10749: "Romance", 10751: "Family", 10752: "War",
+        10759: "Action & Adventure", 10762: "Kids", 10764: "Reality",
+        10765: "Sci-Fi & Fantasy", 10766: "Soap", 10767: "Talk",
+        10768: "War & Politics",
+    }
+    return tuple(names[genre_id] for genre_id in genre_ids if genre_id in names)
+
+
+def _candidate_matches_genre(item: dict[str, Any], media_kind: str,
+                             genre_filter: str | None) -> bool:
+    if not genre_filter:
+        return True
+    mapping = (_TMDB_GENRE_IDS if media_kind == "movie"
+               else _TMDB_TV_GENRE_IDS)
+    wanted_id = mapping.get(genre_filter.casefold())
+    if wanted_id is None:
+        return False
+    return wanted_id in (item.get("genre_ids") or [])
 
 
 def _discover_from_history(
     mine_history: list[dict[str, Any]], *, watched_titles: set[str],
     provider_index: LibraryProviderIndex, requested_keys: set[tuple[str, str]],
     limit: int, now: float | None = None,
+    genre_filter: str | None = None,
 ) -> list[Recommendation]:
     """Discover candidates seeded from this account's recency-weighted most-
     watched titles, blended with TMDB vote_average/vote_count. Excludes
@@ -798,6 +831,9 @@ def _discover_from_history(
             cid = str(item.get("id") or "")
             title = str(item.get("title") or item.get("name") or "")
             if not cid or not title:
+                continue
+            if not _candidate_matches_genre(
+                    item, seed["item_type"], genre_filter):
                 continue
             if title.casefold() in watched_titles:
                 continue
@@ -991,7 +1027,8 @@ def get_recommendations(
         requested_keys = _requested_provider_keys()
         discover = _discover_from_history(
             mine, watched_titles=watched_titles, provider_index=provider_index,
-            requested_keys=requested_keys, limit=limit)
+            requested_keys=requested_keys, limit=limit,
+            genre_filter=genre_filter)
         if len(discover) < _DISCOVER_MIN_SEEDS and (genre_filter or top_genres):
             fallback = _tmdb_discover_recs(
                 genre_filter or top_genres[0],
