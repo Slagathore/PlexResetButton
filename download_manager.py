@@ -740,6 +740,13 @@ class ManualGrabOutcome:
 class DownloadManager:
     """Owns runner subprocesses and post-processing. One instance per app."""
 
+    # Production owns one manager and therefore one queue monitor. Tests make
+    # many short-lived managers against a shared temporary DB; letting every
+    # one spawn a daemon makes old tests restart rows created by later tests.
+    # The test harness disables this seam while exercising monitor passes
+    # explicitly. Runtime behavior remains on by default.
+    _QUEUE_MONITOR_AUTOSTART = True
+
     def __init__(self, *, on_update: Callable[[int], None] | None = None) -> None:
         # on_update(download_id) is called (from worker threads!) whenever a
         # download's row changed — the desktop app marshals it to the UI.
@@ -767,10 +774,13 @@ class DownloadManager:
         # thread to stop. shutdown() sets this so the thread actually exits
         # instead of looping forever with no way to tell it to quit.
         self._stop_event = threading.Event()
+        self._monitor_thread: threading.Thread | None = None
         downloads_store.initialize_downloads_db()
         self._recover_previous_session()
-        threading.Thread(target=self._queue_monitor, name="dl-queue-monitor",
-                         daemon=True).start()
+        if self._QUEUE_MONITOR_AUTOSTART:
+            self._monitor_thread = threading.Thread(
+                target=self._queue_monitor, name="dl-queue-monitor", daemon=True)
+            self._monitor_thread.start()
 
     # ------------------------------------------------------------------
     # Public API
@@ -976,6 +986,10 @@ class DownloadManager:
         orphans that download into staging and hold file locks until the
         next launch's recovery sweep."""
         self._stop_event.set()
+        monitor = self._monitor_thread
+        if (monitor is not None and monitor is not threading.current_thread()
+                and monitor.is_alive()):
+            monitor.join(timeout=2)
         with self._lock:
             procs = dict(self._processes)
             self._processes.clear()

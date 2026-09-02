@@ -83,8 +83,8 @@ def _no_outbound_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_orphan_process_scan(monkeypatch):
-    """Skip DownloadManager's orphaned-runner sweep in tests.
+def _no_download_manager_background_work(monkeypatch):
+    """Skip DownloadManager startup recovery and monitor daemons in tests.
 
     DownloadManager.__init__ -> _recover_previous_session() calls
     psutil.process_iter(['name', 'cmdline']) over every running process to
@@ -93,6 +93,11 @@ def _no_orphan_process_scan(monkeypatch):
     wall clock — real OS work, not network, so the socket guard above can't
     catch it. No test exercises the real orphan-sweep behavior (it's a
     startup-only safety net), so it's a no-op here by default.
+
+    A manager also starts a 60-second queue-monitor daemon. Tests construct
+    many managers against one temporary DB, so old daemons can wake during a
+    later test and restart its deliberately queued row. Monitor decisions are
+    invoked directly by their unit tests; no background thread is needed.
     """
     try:
         import download_manager
@@ -101,6 +106,9 @@ def _no_orphan_process_scan(monkeypatch):
     monkeypatch.setattr(
         download_manager.DownloadManager, "_recover_previous_session",
         lambda self: None, raising=False)
+    monkeypatch.setattr(
+        download_manager.DownloadManager, "_QUEUE_MONITOR_AUTOSTART",
+        False, raising=False)
 
 
 @pytest.fixture(autouse=True)

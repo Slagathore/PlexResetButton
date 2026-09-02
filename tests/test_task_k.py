@@ -227,6 +227,9 @@ def test_indexed_paths_under_prefix_match(index_db, monkeypatch):
     ])
     under = library_index.indexed_paths_under([r"C:\Media\ShowA"])
     assert under == [r"C:\Media\ShowA\ep1.mkv"]
+    # Stored Windows paths keep Windows case/separator semantics even when
+    # this test runs on a Linux CI host.
+    assert library_index.indexed_paths_under(["c:/MEDIA/showa"]) == under
     assert library_index.indexed_paths_under([]) == []
 
 

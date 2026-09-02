@@ -1,4 +1,6 @@
+import ntpath
 import os
+import posixpath
 import sqlite3
 import threading
 import time
@@ -372,14 +374,32 @@ class RefreshResult:
 
 
 def _norm_path(path: str | Path) -> str:
-    return os.path.normcase(os.path.normpath(str(path)))
+    """Normalize a stored media path using the path's own syntax.
+
+    Library rows can contain Windows paths even when maintenance/tests run on
+    Linux.  ``os.path`` follows the current host, so Linux treats a backslash
+    as a normal filename character and cannot recognize a Windows child path.
+    Prefix the normalized value with its flavor so Windows paths remain
+    case-insensitive while POSIX paths retain their case-sensitive behavior.
+    """
+    raw = str(path)
+    is_windows = (
+        "\\" in raw
+        or (len(raw) >= 3 and raw[1] == ":" and raw[2] in "\\/")
+        or raw.startswith("//")
+    )
+    if is_windows:
+        normalized = ntpath.normcase(ntpath.normpath(raw)).replace("\\", "/")
+        return f"win:{normalized}"
+    return f"posix:{posixpath.normpath(raw)}"
 
 
 def _is_under(norm: str, norm_prefix: str) -> bool:
     """True when a normalized path IS a normalized scope prefix or sits under
     it. Equality covers a scope entry that is the changed file itself;
-    startswith(prefix + sep) covers everything inside a changed directory."""
-    return norm == norm_prefix or norm.startswith(norm_prefix + os.sep)
+    startswith(prefix + separator) covers everything inside a changed
+    directory.  _norm_path canonicalizes both path flavors to '/'."""
+    return norm == norm_prefix or norm.startswith(norm_prefix.rstrip("/") + "/")
 
 
 def refresh_library_index(force: bool = False,
