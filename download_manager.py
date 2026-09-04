@@ -586,12 +586,16 @@ def _movie_route_identity_from_want(want: dict | None
 def _request_title_from_row(row) -> str | None:
     """The single source of the title used for routing/naming a download.
 
-    Reads the immutable want snapshot first (collapsing the three historical
-    derivations: restart used the torrent title, _start_row rebuilt from the
-    request, apply_route did a third thing). Falls back to the _start_row
-    reconstruction for rows grabbed before want_json existed, and finally to
-    the torrent row title.
+    An admin who named this download by hand outranks everything else: they
+    were looking at the file, the router was not. Otherwise the immutable want
+    snapshot answers (collapsing the three historical derivations: restart used
+    the torrent title, _start_row rebuilt from the request, apply_route did a
+    third thing), falling back to the _start_row reconstruction for rows
+    grabbed before want_json existed, and finally to the torrent row title.
     """
+    admin_title = (getattr(row, "route_title", None) or "").strip()
+    if admin_title:
+        return admin_title
     want_json = getattr(row, "want_json", None)
     if want_json:
         try:
@@ -1457,13 +1461,26 @@ class DownloadManager:
         note = f" + {removed_files} staged file(s) recycled" if removed_files else ""
         return f"removed (archived — provenance kept){note}"
 
-    def apply_route(self, download_id: int) -> str:
+    def apply_route(self, download_id: int, *,
+                    request_title: str | None = None) -> str:
         """Manually rename+move a completed download per its (re-computed)
-        route plan. Returns a human-readable outcome message."""
+        route plan. Returns a human-readable outcome message.
+
+        `request_title` is the admin naming the thing by hand for a download
+        the router refused to place on its own. It is recorded on the row, so
+        a download still in flight gets routed correctly the moment it
+        finishes rather than needing the click again.
+        """
         row = downloads_store.get_download(download_id)
         if row is None:
             return "Download not found."
+        if request_title and request_title.strip():
+            downloads_store.set_route_title(download_id, request_title)
+            row = downloads_store.get_download(download_id) or row
         if row.status not in ("downloaded",):
+            if row.route_title:
+                return (f"Noted: this is '{row.route_title}'. It will be filed "
+                        f"there when the download finishes (now '{row.status}').")
             return f"Can't apply route while status is '{row.status}'."
         request_title = _request_title_from_row(row)
         return self._finish_post_process(

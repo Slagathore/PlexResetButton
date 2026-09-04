@@ -83,6 +83,13 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # grab time from the RTN parse of the chosen release — CAM knowledge lives
     # in the database, not filenames. Rides into media_quality on verified move.
     ("downloads", "quality_label", "TEXT"),
+    # The canonical show/movie name an admin supplied for a download the
+    # router could not place on its own. Routing refuses to invent a library
+    # folder from a release name (that is how "Her Blaze", "Her.Blaze" and
+    # "Her Blaze 2026" all become folders), so a human naming it is the ONLY
+    # thing that turns an unroutable download into a routed one. Applied
+    # whenever the route is next computed, including automatically on finish.
+    ("downloads", "route_title", "TEXT"),
     # Task E retention (RESOLVED DECISION 5): keep_details exempts a run from
     # the 90-day loser-detail prune; verdict_histogram_json is the forever
     # rejection aggregate ({"cam_or_trash": 3, ...}) that survives pruning.
@@ -135,6 +142,7 @@ class DownloadRow:
     verification_reason: str | None = None
     selection_run_id: int | None = None
     quality_label: str | None = None
+    route_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,7 +161,7 @@ _DOWNLOAD_COLUMNS = (
     "auto_move, error, created_at, completed_at, show_id, season, episode, "
     "replace_path, files_json, failure_key, want_json, removed_at, "
     "removed_reason, verification_state, verification_reason, "
-    "selection_run_id, quality_label"
+    "selection_run_id, quality_label, route_title"
 )
 
 
@@ -534,6 +542,7 @@ def _row_to_download(row) -> DownloadRow:
         want_json=row[23], removed_at=row[24], removed_reason=row[25],
         verification_state=row[26], verification_reason=row[27],
         selection_run_id=row[28], quality_label=row[29],
+        route_title=row[30] if len(row) > 30 else None,
     )
 
 
@@ -626,6 +635,14 @@ def restore_download(download_id: int) -> None:
         conn.execute(
             "UPDATE downloads SET removed_at = NULL, removed_reason = NULL"
             " WHERE id = ?", (download_id,))
+        conn.commit()
+
+
+def set_route_title(download_id: int, title: str | None) -> None:
+    """Record the canonical name an admin gave an unroutable download."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute("UPDATE downloads SET route_title = ? WHERE id = ?",
+                     ((title or "").strip() or None, download_id))
         conn.commit()
 
 

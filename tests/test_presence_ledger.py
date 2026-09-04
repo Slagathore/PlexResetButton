@@ -300,3 +300,64 @@ def test_finished_and_archived_copies_do_not_block_a_fresh_grab():
 def test_a_magnet_with_no_infohash_never_matches():
     assert presence_ledger.live_download_for("magnet:?dn=nothing") is None
     assert presence_ledger.live_download_for("") is None
+
+
+# ---------------------------------------------------------------------------
+# The admin naming an unroutable download
+# ---------------------------------------------------------------------------
+
+def test_admin_name_is_remembered_and_outranks_derived_titles():
+    """Routing refuses to invent a folder from a release name, so a human
+    naming it is the only thing that unblocks it. That name must stick."""
+    import download_manager
+
+    row = _download(title="Her Blaze S01E01 2026 1080p WEB-DL H 265 AAC-ADWeb",
+                    status="downloading")
+    assert row.route_title is None
+
+    downloads_store.set_route_title(row.download_id, "Her Blaze")
+    named = downloads_store.get_download(row.download_id)
+
+    assert named.route_title == "Her Blaze"
+    assert download_manager._request_title_from_row(named) == "Her Blaze"
+
+
+def test_naming_a_download_still_in_flight_defers_instead_of_failing():
+    """The row is not 'downloaded' yet, so the route cannot be applied now —
+    it must be recorded for completion, not rejected."""
+    import download_manager
+
+    row = _download(title="Her Blaze S01E01", status="downloading")
+    manager = download_manager.DownloadManager.__new__(
+        download_manager.DownloadManager)
+    outcome = download_manager.DownloadManager.apply_route(
+        manager, row.download_id, request_title="Her Blaze")
+
+    assert "Her Blaze" in outcome
+    assert downloads_store.get_download(row.download_id).route_title == "Her Blaze"
+
+
+def test_naming_creates_the_folder_a_release_name_could_not(tmp_path, monkeypatch):
+    """With a canonical name the router creates a new show folder; with only
+    the release name it refuses. That refusal is the guard, not a bug: it is
+    what stops "Her Blaze", "Her.Blaze" and "Her Blaze 2026" all becoming
+    separate library folders."""
+    import torrent_routing
+
+    tv_root = tmp_path / "Tv Shows"
+    tv_root.mkdir()
+    monkeypatch.setattr(torrent_routing.config, "media_paths_for_types",
+                        lambda _mt: [str(tv_root)], raising=False)
+    monkeypatch.setattr(torrent_routing, "find_show_folder",
+                        lambda *a, **k: (None, 0.0, None))
+
+    release = "Her Blaze S01E01 2026 1080p WEB-DL H 265 AAC-ADWeb"
+
+    unnamed = torrent_routing.plan_route(release, "tv")
+    assert not unnamed.confident
+    assert "no confident show-folder match" in unnamed.reason
+
+    named = torrent_routing.plan_route(release, "tv", request_title="Her Blaze")
+    assert named.confident
+    assert "Her Blaze" in named.show_folder
+    assert named.season_folder == "Season 01"

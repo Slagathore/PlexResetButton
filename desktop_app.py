@@ -2961,6 +2961,15 @@ class DesktopApp:
 
         dm = self.download_manager
         menu = tk.Menu(tree, tearoff=0)
+        # Whatever is WRONG with this row goes at the top, phrased as the fix
+        # rather than the complaint. The route column can say "no confident
+        # show-folder match for 'Her Blaze'" all day; what the admin needs is
+        # a way to say what it is and have it filed.
+        fixes = self._route_fixes(row)
+        if fixes:
+            for label, action in fixes:
+                menu.add_command(label=label, command=action)
+            menu.add_separator()
         menu.add_command(label="⏸ Stop / Pause", command=lambda: run(dm.stop, "stop"))
         menu.add_command(label="▶ Restart / Resume", command=lambda: run(dm.restart, "restart"))
         menu.add_command(label="🔍 Recheck data", command=lambda: run(dm.recheck, "recheck"))
@@ -2985,6 +2994,84 @@ class DesktopApp:
                                  and row.episode is not None else None)),
         )
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _route_fixes(self, row) -> list:
+        """(label, callback) pairs that address THIS row's specific problem.
+
+        Empty when nothing is wrong, so a healthy download's menu is unchanged.
+        """
+        reason = (row.route_reason or "").lower()
+        fixes: list = []
+
+        if "no confident show-folder match" in reason:
+            fixes.append((
+                "📁 Tell Sensarr what show this is…",
+                lambda: self._name_this_download(row)))
+        elif "couldn't parse a season number" in reason:
+            fixes.append((
+                "📁 Tell Sensarr what show this is…",
+                lambda: self._name_this_download(row)))
+        elif "no per-movie folder" in reason or "missing_folder_id" in reason:
+            fixes.append((
+                "🎬 Name this movie…",
+                lambda: self._name_this_download(row)))
+
+        if row.verification_state == "failed":
+            fixes.append((
+                f"⚠ Why it failed: {(row.verification_reason or 'no reason recorded')[:60]}",
+                lambda: self._show_scrollable_text(
+                    f"Download #{row.download_id}",
+                    f"Verification failed.\n\n{row.verification_reason or ''}\n\n"
+                    f"Route: {row.route_reason or ''}")))
+        if row.status == "error" and row.error:
+            fixes.append((
+                f"⚠ Error: {row.error[:60]}",
+                lambda: self._show_scrollable_text(
+                    f"Download #{row.download_id}", row.error or "")))
+        if row.route_title:
+            fixes.append((
+                f"✓ Filed as '{row.route_title}' (change…)",
+                lambda: self._name_this_download(row)))
+        return fixes
+
+    def _name_this_download(self, row) -> None:
+        """Ask what this download IS, then route it under that name.
+
+        Routing deliberately refuses to invent a library folder out of a
+        release name, because "Her Blaze", "Her.Blaze" and "Her Blaze 2026"
+        would all become separate folders. A human supplying the canonical
+        name is what unblocks it — and the name is remembered, so a download
+        still in flight is filed correctly the moment it finishes.
+        """
+        from tkinter import simpledialog
+        suggestion = row.route_title or ""
+        if not suggestion:
+            try:
+                parsed = torrent_routing.parse_torrent_name(row.title)
+                suggestion = parsed.show_title or ""
+            except Exception:
+                suggestion = ""
+        kind = "movie" if row.media_type == "movie" else "show"
+        answer = simpledialog.askstring(
+            f"Name this {kind}",
+            f"What {kind} is this?\n\n{row.title[:90]}\n\n"
+            f"Sensarr will create the folder under the right library root and "
+            f"file it there. Use the name you want the folder to have.",
+            initialvalue=suggestion, parent=self.root)
+        if answer is None:
+            return
+        answer = answer.strip()
+        if not answer:
+            self._dl_status_var.set("No name given — nothing changed.")
+            return
+
+        def worker() -> None:
+            outcome = self.download_manager.apply_route(
+                row.download_id, request_title=answer)
+            self._post_to_ui(lambda: self._handle_apply_route_result(outcome))
+
+        threading.Thread(target=worker, name="ui-name-download",
+                         daemon=True).start()
 
     def cancel_selected_download(self) -> None:
         download_id = self._selected_download_id()
