@@ -196,6 +196,42 @@ def _country_tag(m: MediaResult) -> str:
     return " [" + "/".join(str(c).upper() for c in countries[:2]) + "]"
 
 
+def _release_note(m: MediaResult) -> str:
+    """'out Jul 24, 2026 (5 weeks away)' / 'released Aug 2, 2024', or ''.
+
+    Requests are made from trailers and rumours as often as from listings, so
+    the confirmation says plainly when the thing actually exists. An unreleased
+    date is also why auto-grab will sit on the request instead of searching
+    every five minutes for something nobody has.
+    """
+    raw = str(getattr(m, "release_date", "") or "")[:10]
+    if len(raw) != 10:
+        return ""
+    try:
+        from datetime import date as _date
+        year, month, day = (int(part) for part in raw.split("-"))
+        when = _date(year, month, day)
+    except (ValueError, TypeError):
+        return ""
+
+    from datetime import date as _date2
+    today = _date2.today()
+    pretty = f"{when.strftime('%b')} {when.day}, {when.year}"
+    if when <= today:
+        return f"released {pretty}"
+
+    days = (when - today).days
+    if days <= 1:
+        away = "tomorrow"
+    elif days < 14:
+        away = f"{days} days away"
+    elif days < 60:
+        away = f"{round(days / 7)} weeks away"
+    else:
+        away = f"{round(days / 30)} months away"
+    return f"out {pretty} ({away})"
+
+
 def _display_for_in_lib(lr: LookupResult) -> str:
     """
     Pick the best display string for an in-library item.
@@ -294,9 +330,12 @@ def _build_results_message(
             qualifier_str = f" [{m.qualifier}]" if m.qualifier else ""
             country_str = _country_tag(m)
             title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
+            release_str = _release_note(m)
             lines.append(
                 f"  <b>{num}.</b> {title_link}{qualifier_str}{year_str}{country_str}"
                 f"  <i>[{m.source.upper()}]</i>")
+            if release_str:
+                lines.append(f"     <i>{release_str}</i>")
         lines.append("")
 
     if uncertain:
@@ -784,21 +823,35 @@ def _tv_status(match: MediaResult) -> tuple[str, str]:
 
 
 def _owned_seasons(match: MediaResult) -> set[int]:
-    """Regular seasons already on disk for this show's tracked-show row, or
-    an empty set when untracked or on any lookup failure."""
+    """Regular seasons already on disk for this show.
+
+    The tracked-show row answers first (it is identity-keyed and exact). When
+    there is no such row — the show was never tracked, or is tracked under the
+    other provider's id — the library index answers instead, so the picker
+    stops offering seasons that are already sitting on the drive.
+    """
+    seasons: set[int] = set()
     try:
         source = getattr(match, "source", None)
         ext = str(getattr(match, "external_id", "") or "")
-        if not (source and ext):
-            return set()
-        show = shows_store.get_show_by_identity(source, ext)
-        if show is None:
-            return set()
-        return shows_store.have_seasons(show.show_id)
+        if source and ext:
+            show = shows_store.get_show_by_identity(source, ext)
+            if show is not None:
+                seasons = shows_store.have_seasons(show.show_id)
     except Exception:
         logger.debug("Owned-season lookup failed for %r", getattr(match, "title", "?"),
                     exc_info=True)
-        return set()
+
+    if seasons:
+        return seasons
+    title = (getattr(match, "title", "") or "").strip()
+    if not title:
+        return seasons
+    try:
+        return media_lookup.owned_seasons_from_library(title)
+    except Exception:
+        logger.debug("Library season fallback failed for %r", title, exc_info=True)
+        return seasons
 
 
 def _season_context_line(*, total: int | None, status_label: str, next_air: str,

@@ -153,8 +153,35 @@ async def requests_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # format_requests_message_user omits requester names for privacy
     requests_text = await loop.run_in_executor(None, format_requests_message_user)
     await update.message.reply_text(
-        requests_text + "\n\nTap 📝 Requests to add one."
+        requests_text
+        + "\n\nTap 📝 Requests to add one, or /detail <number> for the "
+          "file-by-file state of one of them."
     )
+
+
+async def detail_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/detail <request id> — the exact state of one request, file by file."""
+    if update.message is None:
+        return
+    args = context.args or []
+    if not args or not args[0].strip().lstrip("#").isdigit():
+        await update.message.reply_text(
+            "Usage: /detail <request number>\n"
+            "The number is the one shown next to each item in /requests.")
+        return
+    request_id = int(args[0].strip().lstrip("#"))
+    loop = asyncio.get_running_loop()
+
+    def build() -> str:
+        import grab_queue
+        return grab_queue.request_detail(request_id)
+
+    try:
+        text = await loop.run_in_executor(None, build)
+    except Exception:
+        logger.exception("Request detail failed for #%s", request_id)
+        text = "Could not read that request's status just now."
+    await update.message.reply_text(text)
 
 
 async def libraries_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

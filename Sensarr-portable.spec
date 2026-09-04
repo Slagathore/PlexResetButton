@@ -13,8 +13,14 @@ project_dir = Path(spec_file).resolve().parent if spec_file else Path.cwd().reso
 
 datas = []
 datas += collect_data_files("sv_ttk")
-# rank-torrent-name + parsett pattern data files (selection engine).
+# rank-torrent-name + its parser (distribution "parsett", IMPORT PACKAGE "PTT")
+# carry regex/pattern data files the analysis misses. collect_data_files takes
+# an IMPORT name, so "parsett" collected nothing and PTT/keywords/*.txt was
+# left out of 1.6.0 — PTT's default adult-keyword handler reads those files on
+# EVERY parse, so every release name raised FileNotFoundError and the selection
+# engine rejected the entire world as "unparseable". Collect "PTT" by name.
 datas += collect_data_files("RTN")
+datas += collect_data_files("PTT")
 datas += collect_data_files("parsett")
 for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
     _src = project_dir / "torrent_runner" / _rf
@@ -26,6 +32,7 @@ hiddenimports = (
     + collect_submodules("pystray")
     # rank-torrent-name (selection engine) + transitive deps.
     + collect_submodules("RTN")
+    + collect_submodules("PTT")
     + collect_submodules("parsett")
     + collect_submodules("pydantic")
     # watchdog's observer backend is chosen by dynamic import at runtime; collect

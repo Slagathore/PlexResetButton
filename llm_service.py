@@ -10,6 +10,11 @@
 #      the user's free-form text and returns structured JSON: category, guessed
 #      title, reasoning, and an adult-content flag.
 #
+#   3. translate_title_to_english()  — a native-script title ("逐玉") searched
+#      verbatim finds nothing on trackers that index English release names,
+#      while its English title ("Pursuit of Jade") has whole seasons sitting
+#      there. Cached; returns None when Ollama is not running.
+#
 # Ollama must be running locally (default: http://localhost:11434).
 # Pull the desired model first, e.g.:  ollama pull gemma3:1b
 #
@@ -19,6 +24,7 @@
 
 import json
 import logging
+import re
 from typing import Any
 
 import config
@@ -145,6 +151,49 @@ def fuzzy_correct_title(user_input: str, candidates: list[str]) -> str | None:
 
     # LLM hallucinated something; fall back to rapidfuzz
     return _rapidfuzz_pick(user_input, candidates)
+
+
+_TRANSLATION_CACHE: dict[str, str | None] = {}
+
+
+def translate_title_to_english(title: str) -> str | None:
+    """English title for a native-script one, or None when unavailable.
+
+    Deliberately conservative: the model is asked for the title only, and any
+    answer that comes back long, chatty, or still non-Latin is discarded. A
+    wrong translation would send the search somewhere useless, so "no answer"
+    is the safer failure.
+    """
+    text = (title or "").strip()
+    if not text:
+        return None
+    if text in _TRANSLATION_CACHE:
+        return _TRANSLATION_CACHE[text]
+
+    answer: str | None = None
+    if llm_available():
+        prompt = (
+            f'What is the English title of the film or TV series "{text}"?\n'
+            "Reply with ONLY the English title, nothing else. "
+            "If it has no established English title, give a literal English "
+            "translation of the words. If you do not recognise it at all, "
+            "reply with the single word NONE."
+        )
+        reply = (_chat(prompt) or "").strip().strip('"').strip()
+        first = reply.splitlines()[0].strip() if reply else ""
+        looks_usable = (
+            first
+            and first.upper() != "NONE"
+            and len(first) <= 80
+            and re.search(r"[A-Za-z]", first) is not None
+            and len(first.split()) <= 10
+        )
+        answer = first if looks_usable else None
+        if answer:
+            logger.info("Translated title %r -> %r for searching.", text, answer)
+
+    _TRANSLATION_CACHE[text] = answer
+    return answer
 
 
 def categorize_other_request(user_text: str) -> dict:

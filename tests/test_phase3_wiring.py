@@ -483,3 +483,31 @@ def test_manual_sequel_pick_needs_override_then_records_it(monkeypatch):
     assert stats.get("manual_override") == "cole says grab it anyway"
     assert stats.get("overridden_reason_code") in (
         "sequel_mismatch", "numeric_title_mismatch")
+
+
+# ---------------------------------------------------------------------------
+# A season pack already in flight must not be grabbed again.
+# ---------------------------------------------------------------------------
+
+def test_season_pack_is_not_regrabbed_while_one_is_in_flight(monkeypatch):
+    """Live regression (Widow's Bay): a pack grab leaves NO per-episode trace,
+    so the caller's has_progress check could not see it and every five-minute
+    pass queued another identical copy — 32 of them in two hours."""
+    req_row = request_intake.add_matched_request(
+        "test drama", "cole", media_type="tv", match=_show(), season=1)
+    req = queue_store.get_request(req_row.request_id)
+    pack = _res("Test.Drama.US.S01.1080p.WEB.x264-GRP", "pack",
+                size=6 * _GB, seeders=25, media_type="tv")
+    dm = _dm(monkeypatch, [pack])
+
+    first = dm._grab_request_seasonwise(req)
+    assert len(first) == 1
+
+    # Same request, next pass. The pack from the first pass is still queued.
+    req = queue_store.get_request(req_row.request_id)
+    second = dm._grab_request_seasonwise(req)
+    assert second == [], "a second copy of the same season pack was queued"
+
+    packs = [row for row in downloads_store.downloads_for_request(
+        req_row.request_id) if row.episode is None]
+    assert len(packs) == 1

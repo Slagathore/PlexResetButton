@@ -726,6 +726,29 @@ def search_library(query: str, *, limit: int | None = None,
     return _search_local_index(clean_query, limit)
 
 
+# Separators that differ between how a title is WRITTEN and how a file is
+# NAMED. "Spider-Man- Brand New Day 2026.mkv" is the same film as "spiderman
+# brand new day", but a plain LIKE sees no overlap at all, so the presence
+# check answered "not in your library" for something already sitting on disk.
+_COMPACT_SEPARATORS = (" ", ".", "-", "_", "'", ":", ",", "!", "?",
+                       "(", ")", "[", "]", "&")
+
+# Built once from the static tuple above; every separator goes in as char(N)
+# so no SQL string quoting is involved and nothing user-supplied is ever
+# interpolated into the statement.
+_COMPACT_SQL = "search_name"
+for _sep in _COMPACT_SEPARATORS:
+    _COMPACT_SQL = f"REPLACE({_COMPACT_SQL}, char({ord(_sep)}), '')"
+
+
+def compact_name(text: str) -> str:
+    """The separator-free spelling used for the punctuation-blind match."""
+    out = (text or "").casefold()
+    for sep in _COMPACT_SEPARATORS:
+        out = out.replace(sep, "")
+    return out
+
+
 def _search_local_index(clean_query: str, limit: int | None) -> list[LibraryEntry]:
     initialize_library_index_db()
     max_results = limit or config.LIBRARY_SEARCH_RESULT_LIMIT
@@ -742,6 +765,22 @@ def _search_local_index(clean_query: str, limit: int | None) -> list[LibraryEntr
             """,
             (f"%{clean_query}%", max_results),
         ).fetchall()
+        if not rows:
+            # Punctuation-blind second pass. It only runs when the indexed
+            # (and therefore fast) match found nothing, so the table scan is
+            # paid once per genuine miss rather than on every search.
+            compact = compact_name(clean_query)
+            if compact:
+                rows = conn.execute(
+                    f"""
+                    SELECT name, path, root_path, size_bytes, modified_at
+                    FROM library_files
+                    WHERE {_COMPACT_SQL} LIKE ?
+                    ORDER BY name ASC
+                    LIMIT ?
+                    """,
+                    (f"%{compact}%", max_results),
+                ).fetchall()
 
     return [
         LibraryEntry(

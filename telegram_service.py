@@ -12,7 +12,7 @@ import config
 from bot import (cmd_button_handler, hardreset_confirm_handler,
                  hardreset_handler, help_handler, launch_handler,
                  libraries_handler, metrics_handler, reindex_handler,
-                 request_handler, requests_handler,
+                 detail_handler, request_handler, requests_handler,
                  search_handler, start_handler, status_handler,
                  welcome_fallback_handler)
 from request_flow import REQUEST_CONV_HANDLER
@@ -113,6 +113,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("metrics", metrics_handler))
     app.add_handler(CommandHandler("request", request_handler))   # legacy free-text add
     app.add_handler(CommandHandler("requests", requests_handler)) # shows queue (no names)
+    app.add_handler(CommandHandler("detail", detail_handler))     # one request, file by file
     app.add_handler(CommandHandler("search", search_handler))
     app.add_handler(CommandHandler("reindex", reindex_handler))
     app.add_handler(CommandHandler("hardreset", hardreset_handler))

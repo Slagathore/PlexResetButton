@@ -29,6 +29,10 @@ datas += collect_data_files("sv_ttk")
 # rank-torrent-name + its parser parsett carry regex/pattern data files that
 # the analysis misses; collect them so the selection engine parses in the build.
 datas += collect_data_files("RTN")
+# "PTT" is the import name of the parsett distribution; its keywords/*.txt are
+# read on every parse, so collecting only "parsett" ships a parser that cannot
+# parse anything (see rtn_compat).
+datas += collect_data_files("PTT")
 datas += collect_data_files("parsett")
 # The Node webtorrent downloader: ship the script + manifests as the
 # read-only seed. node_modules is NOT bundled — the app seeds a writable
@@ -43,6 +47,7 @@ hiddenimports = (
     collect_submodules("telegram")
     + collect_submodules("pystray")
     + collect_submodules("RTN")
+    + collect_submodules("PTT")
     + collect_submodules("parsett")
     + collect_submodules("pydantic")
     + ["pydantic_core", "orjson", "Levenshtein", "arrow", "pymediainfo"]

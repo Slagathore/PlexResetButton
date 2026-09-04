@@ -458,6 +458,13 @@ DOWNLOAD_MAX_ROTATIONS: int = int(os.getenv("DOWNLOAD_MAX_ROTATIONS", "2"))
 # 0-seed torrent never finishes. The zero-seeder race (below) is the ONLY path
 # allowed to gamble on unseeded candidates, and only when explicitly enabled.
 MIN_SEEDERS: int = int(os.getenv("MIN_SEEDERS", "1"))
+# How early before a movie's release date auto-grab starts searching for it.
+# Requests get made off trailers, so a film can sit open for months while every
+# pass burns provider calls on something that does not exist yet. Screeners and
+# early web rips do show up shortly before release, hence a lead window rather
+# than waiting for the day itself. 0 disables the hold entirely.
+MOVIE_PRERELEASE_LEAD_DAYS: int = int(
+    os.getenv("MOVIE_PRERELEASE_LEAD_DAYS", "30"))
 # The zero-seeder race is OFF by default: when nothing seeded survives the gates
 # the request is deferred and rechecked later instead of grabbing dead torrents.
 # Turn it on to gamble on a bounded set of unseeded candidates at once.

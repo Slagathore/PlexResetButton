@@ -123,6 +123,23 @@ def run_health_checks(*, bot_running: bool | None = None) -> list[CheckResult]:
     checks.append(CheckResult(bool(config.TVDB_API_KEY), "TVDB key",
                               "configured" if config.TVDB_API_KEY else "missing — TV episode lists degraded"))
 
+    # The release-name parser. A build that cannot parse rejects every
+    # candidate as "unparseable" and grabs nothing at all, which is exactly
+    # what 1.6.0 shipped doing — in total silence. Never again without a
+    # red line on the Status tab.
+    try:
+        import rtn_compat
+        parser = rtn_compat.parser_status()
+        detail = {
+            rtn_compat.STATUS_OK: "working",
+            rtn_compat.STATUS_DEGRADED:
+                f"working, bundled keyword data missing ({parser['detail']})",
+        }.get(parser["status"],
+              f"BROKEN ({parser['detail']}), nothing can be grabbed")
+        checks.append(CheckResult(parser["healthy"], "Release parser", detail))
+    except Exception as exc:
+        checks.append(CheckResult(False, "Release parser", f"check failed: {exc}"))
+
     # Torrent pipeline
     node = shutil.which(config.NODE_PATH)
     checks.append(CheckResult(bool(node), "Node.js",

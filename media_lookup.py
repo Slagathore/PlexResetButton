@@ -70,6 +70,10 @@ class MediaResult:
     # available; empty for movies and jikan/anidb). This is what lets the user
     # pick the right AU vs US edition — TVDB gives those distinct ids.
     origin_countries: tuple[str, ...] = ()
+    # ISO release / first-air date ("2026-07-24") when the provider gave one.
+    # Shown on the request confirmation, and the reason auto-grab does not
+    # burn searches on a film that is still months from existing.
+    release_date: str | None = None
 
 
 def best_title_similarity(query: str, result: "MediaResult") -> float:
@@ -256,6 +260,7 @@ def search_tmdb_movies(title: str, year: int | None = None, *, limit: int = 5) -
             media_type="movie",
             overview=(item.get("overview") or "")[:200],
             source="tmdb",
+            release_date=rd or None,
         ))
 
     return results
@@ -313,6 +318,7 @@ def search_tmdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
             source="tmdb",
             alt_titles=(original,) if original and original != name else (),
             origin_countries=countries,
+            release_date=fa or None,
         ))
 
     return results
@@ -1082,6 +1088,41 @@ def _season_from_library_entry(entry) -> int | None:
     return None
 
 
+def owned_seasons_from_library(title: str) -> set[int]:
+    """Season numbers with at least one file on disk for `title`.
+
+    The Telegram season picker asks shows_store first, but that only knows
+    about shows the tracker has a row for, under the exact provider identity
+    the request resolved to. A show grabbed manually, tracked under the other
+    provider, or never tracked at all therefore looked completely un-owned and
+    the picker offered seasons the user already had. The library index knows
+    what is actually on disk regardless of any of that, so it answers second.
+
+    Never raises: an index hiccup means "no evidence", not a crash.
+    """
+    try:
+        from library_index import search_library
+        entries = search_library(title, limit=400, local_only=True)
+    except Exception:
+        logger.debug("Library season scan failed for %r", title, exc_info=True)
+        return set()
+
+    wanted = title.casefold()
+    seasons: set[int] = set()
+    for entry in entries:
+        haystack = f"{getattr(entry, 'name', '')} {getattr(entry, 'path', '')}"
+        # The index matched loosely; make sure the hit really is this show
+        # before believing its season number.
+        if (wanted not in haystack.casefold()
+                and title_similarity(wanted, clean_library_name(
+                    getattr(entry, "name", ""))) < _FUZZY_LIBRARY_THRESHOLD):
+            continue
+        season = _season_from_library_entry(entry)
+        if season is not None and season > 0:
+            seasons.add(season)
+    return seasons
+
+
 def _word_fallback_search(title: str) -> list:
     """
     When a full-title search finds nothing (e.g. due to a typo), search
@@ -1537,6 +1578,35 @@ def get_tmdb_movie_runtime(movie_id: str) -> float | None:
             logger.debug("TMDB movie runtime fetch failed for %s: %s", movie_id, exc)
     _runtime_cache[key] = minutes
     return minutes
+
+
+_release_date_cache: dict[str, str | None] = {}
+
+
+def get_tmdb_release_date(external_id: str, media_type: str) -> str | None:
+    """ISO release / first-air date for a TMDB id, cached per id.
+
+    Requests created before the release date was stored have no date on the
+    row; this fills it in on demand so the pre-release hold applies to the
+    queue that already exists, not just to new requests.
+    """
+    endpoint = "tv" if media_type in ("tv", "anime", "xanime") else "movie"
+    key = f"{endpoint}:{external_id}"
+    if key in _release_date_cache:
+        return _release_date_cache[key]
+    date: str | None = None
+    if _tmdb_enabled() and external_id:
+        try:
+            data = _get_json(
+                f"{_TMDB_BASE}/{endpoint}/{external_id}"
+                f"?api_key={config.TMDB_API_KEY}")
+            raw = str(data.get("release_date") or data.get("first_air_date") or "")
+            date = raw[:10] if len(raw) >= 10 else None
+        except RuntimeError as exc:
+            logger.debug("TMDB release-date fetch failed for %s: %s",
+                         external_id, exc)
+    _release_date_cache[key] = date
+    return date
 
 
 def get_tmdb_tv_episodes(tv_id: str) -> list[EpisodeInfo]:

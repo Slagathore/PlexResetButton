@@ -395,6 +395,31 @@ def decision_detail(selection_run_id: int) -> dict | None:
 # Actions (store-level; the Tk right-click menu is thin glue over these)
 # ---------------------------------------------------------------------------
 
+def request_detail(request_id: int) -> str:
+    """Exactly where one request stands, file by file, as plain text.
+
+    The queue view rounds a request down to a status word; someone asking
+    about their show wants to know WHICH episodes are on disk, which are
+    downloading, and which nobody has yet. Both the desktop Requests tab and
+    the bot's /detail command render this.
+    """
+    import presence_ledger
+    import queue_store
+
+    def _resolve_show(req):
+        import shows_store
+        source = getattr(req, "identity_source", None)
+        ext = getattr(req, "external_id", None)
+        if source and ext:
+            return shows_store.get_show_by_identity(str(source), str(ext))
+        return None
+
+    report = presence_ledger.request_report(
+        request_id, get_request=queue_store.get_request,
+        resolve_show=_resolve_show)
+    return presence_ledger.format_report(report)
+
+
 def defer_request(request_id: int, *, hours: float = DEFER_HOURS_DEFAULT,
                   reason: str = "deferred by user") -> None:
     """User Defer: move the request to 'deferred' with an explicit deferral

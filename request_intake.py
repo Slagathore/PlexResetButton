@@ -267,6 +267,7 @@ def add_matched_request_reporting(
         aliases=aliases or None,
         season=season,
         batch_id=batch_id,
+        release_date=getattr(match, "release_date", None),
     )
     _maybe_track_show(created)
     return created, False
@@ -420,6 +421,7 @@ def resolve_request(request_id: int, match, *, season: int | None = None):
         origin_countries=countries or None,
         aliases=aliases or None,
         season=season,
+        release_date=getattr(match, "release_date", None),
     )
 
 

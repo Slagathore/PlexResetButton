@@ -56,7 +56,8 @@ from download_manager import DownloadManager
 from grab_queue_tab import GrabQueueTab
 from health import format_health_report
 from shows_tab import ShowsTab
-from torrent_search import TorrentResult, format_size, search_torrents
+from torrent_search import (TorrentResult, format_size, search_torrents,
+                            search_torrents_detail)
 from watchlist_tab import WatchlistTab
 from ui_helpers import add_tooltip, begin_busy, ellipsize, make_sortable
 
@@ -888,7 +889,8 @@ class DesktopApp:
         ttk.Button(requests_toolbar, text="🆔 Resolve", command=self.resolve_selected_request).grid(row=0, column=9, padx=(0, 6))
         ttk.Button(requests_toolbar, text="⬇ Grab Torrent", command=self.grab_torrent_for_selected_request).grid(row=0, column=6, padx=(0, 6))
         ttk.Button(requests_toolbar, text="Complete Selected", command=self.complete_selected_request).grid(row=0, column=7, padx=(0, 6))
-        ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=8)
+        ttk.Button(requests_toolbar, text="Details", command=self.show_request_detail).grid(row=0, column=8, padx=(0, 6))
+        ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=9)
 
         requests_frame = ttk.Frame(requests_list_tab)
         requests_frame.grid(row=1, column=0, sticky="nsew")
@@ -1660,6 +1662,56 @@ class DesktopApp:
             self.status_var.set(
                 f"Resolved request #{request_id} → {match.title} ({updated.status})")
         self.refresh_requests()
+
+    def show_request_detail(self) -> None:
+        """File-by-file state of the selected request.
+
+        The list column can only say "grabbing"; this says which episodes are
+        on disk, which are downloading, and which nobody has yet — the thing
+        anyone actually wants to know when they ask about their request.
+        """
+        if self.requests_tree is None:
+            return
+        selected = self.requests_tree.selection()
+        if not selected:
+            self._show_warning("No request selected",
+                               "Select a request in the list first.")
+            return
+        values = self.requests_tree.item(selected[0], "values")
+        request_id = int(values[0])
+
+        def worker() -> None:
+            try:
+                import grab_queue
+                text = grab_queue.request_detail(request_id)
+            except Exception as exc:
+                logger.exception("Request detail failed for #%s", request_id)
+                text = f"Could not read request #{request_id}: {exc}"
+            self._post_to_ui(lambda: self._show_scrollable_text(
+                f"Request #{request_id}", text))
+
+        threading.Thread(target=worker, name="ui-request-detail",
+                         daemon=True).start()
+
+    def _show_scrollable_text(self, title: str, text: str) -> None:
+        """A read-only scrollable window — reports are longer than a dialog."""
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.geometry("760x520")
+        frame = ttk.Frame(window, padding=8)
+        frame.pack(fill="both", expand=True)
+        widget = tk.Text(frame, wrap="none", font=("Consolas", 10))
+        scroll_y = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
+        scroll_x = ttk.Scrollbar(frame, orient="horizontal", command=widget.xview)
+        widget.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        widget.grid(row=0, column=0, sticky="nsew")
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+        ttk.Button(window, text="Close", command=window.destroy).pack(pady=(0, 8))
 
     def complete_selected_request(self) -> None:
         if self.requests_tree is None:
@@ -2688,16 +2740,18 @@ class DesktopApp:
 
         def worker() -> None:
             try:
-                results = search_torrents(query, media_type, limit=40)
+                results, used = search_torrents_detail(query, media_type, limit=40)
             except Exception as exc:
                 logger.exception("Torrent search failed.")
                 self._post_to_ui(lambda: self._dl_status_var.set(f"Search failed: {exc}"))
                 return
-            self._post_to_ui(lambda: self._handle_torrent_results(query, results))
+            self._post_to_ui(
+                lambda: self._handle_torrent_results(query, results, used))
 
         threading.Thread(target=worker, name="ui-torrent-search", daemon=True).start()
 
-    def _handle_torrent_results(self, query: str, results: list[TorrentResult]) -> None:
+    def _handle_torrent_results(self, query: str, results: list[TorrentResult],
+                                used_query: str = "") -> None:
         if self._dl_results_tree is None:
             return
         self._dl_results = results
@@ -2708,7 +2762,12 @@ class DesktopApp:
                 "", "end", iid=str(idx),
                 values=(r.title, format_size(r.size_bytes), r.seeders, r.source),
             )
-        self._dl_status_var.set(f'{len(results)} result(s) for "{query}"')
+        # When the ladder had to rewrite the query (dots collapsed, apostrophes
+        # dropped, one distinctive word), say so — otherwise the results look
+        # like they came from somewhere else entirely.
+        rewritten = used_query and used_query.casefold() != query.casefold()
+        via = f" (searched as: {used_query})" if rewritten else ""
+        self._dl_status_var.set(f'{len(results)} result(s) for "{query}"{via}')
         if not results:
             self._dl_plan_var.set("No results — try another search term or media type.")
 

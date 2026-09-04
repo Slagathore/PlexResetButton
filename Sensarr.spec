@@ -12,9 +12,14 @@ datas = []
 # sv-ttk ships its Sun Valley theme as Tcl data files; without collecting them
 # the dark theme silently falls back to the stock gray ttk look in the EXE.
 datas += collect_data_files("sv_ttk")
-# rank-torrent-name + its parser parsett carry regex/pattern data files that
-# the analysis misses; collect them so the selection engine parses in the EXE.
+# rank-torrent-name + its parser (distribution "parsett", IMPORT PACKAGE "PTT")
+# carry regex/pattern data files the analysis misses. collect_data_files takes
+# an IMPORT name, so "parsett" collected nothing and PTT/keywords/*.txt was
+# left out of 1.6.0 — PTT's default adult-keyword handler reads those files on
+# EVERY parse, so every release name raised FileNotFoundError and the selection
+# engine rejected the entire world as "unparseable". Collect "PTT" by name.
 datas += collect_data_files("RTN")
+datas += collect_data_files("PTT")
 datas += collect_data_files("parsett")
 # The Node webtorrent downloader lives beside the app; ship the script +
 # manifest so the Downloads pipeline works from the bundle. (node_modules is
@@ -32,6 +37,7 @@ hiddenimports = (
     # the parser; pydantic/pydantic_core back the models; the rest are RTN's
     # runtime deps that get imported dynamically.
     + collect_submodules("RTN")
+    + collect_submodules("PTT")
     + collect_submodules("parsett")
     + collect_submodules("pydantic")
     # watchdog picks its observer backend at runtime (read_directory_changes on

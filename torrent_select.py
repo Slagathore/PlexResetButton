@@ -17,6 +17,12 @@
 # rewired in Phase 3; the legacy pick_best_result / filter_viable_results stay
 # alive until then. note: deferred to Phase 3 (wiring).
 #
+# Parsing goes through rtn_compat, never RTN.parse directly. Gate 1 used to
+# swallow every parser exception and code it as the release's own fault
+# ("unparseable"); a build shipped without PTT's keyword data files then made
+# EVERY title raise, and the engine rejected the entire world in silence. A
+# parser fault is now 'parse_error' and says so in the log.
+#
 # API fact (Phase 0 spike, tests/test_rtn_spike.py): RTN 1.11.1 has NO
 # check_trash function. The trash contract is ParsedData.trash + check_fetch +
 # GarbageTorrent via rank(remove_trash=True). We read ParsedData.trash directly
@@ -35,9 +41,10 @@ from importlib import metadata
 from typing import Callable, Iterable, Optional
 
 import RTN
-from RTN import DefaultRanking, SettingsModel, parse, title_match
+from RTN import DefaultRanking, SettingsModel, title_match
 
 import media_identity
+import rtn_compat
 from media_identity import MediaIdentity
 
 # ---------------------------------------------------------------------------
@@ -58,6 +65,19 @@ _SEED_HEALTH_MAX = 8.0         # 0-8, log-scaled
 _SEASON_PACK_BONUS = 15.0      # +15 for a pack on a whole-season want
 _COUNTRY_ALIAS_BONUS = 20.0    # +20 on a POSITIVE country/alias match
 _RECENT_FAILURE_PENALTY = -25.0  # replaces _prefer_unfailed's pre-sort reorder
+
+# Cole watches on a 1080p setup and does not want 4K eating the disk. This is a
+# PENALTY, not a gate: when 2160p is the only thing anyone is seeding it still
+# wins, it just loses to every sane 1080p/720p release that exists.
+_UHD_PENALTY = -60.0
+# Movies only: a release tagged with a non-English language is usually IN that
+# language. Not a disqualifier (some titles exist only that way), but a heavy
+# non-preference — fully cancelled when the title also says ENG/English, which
+# in practice means dual audio or an English track alongside.
+_FOREIGN_LANGUAGE_PENALTY = -40.0
+# Anime the other way round: an English sub/dub marker is what makes a release
+# watchable here, so it is a strong positive rather than a requirement.
+_ENGLISH_ANIME_BONUS = 30.0
 
 
 def rtn_version() -> str:
@@ -104,10 +124,8 @@ def parse_quality_label(title: str) -> Optional[str]:
     entry points that never went through a scored decision."""
     if not (title or "").strip():
         return None
-    try:
-        return quality_label_from_parsed(parse(title))
-    except Exception:
-        return None
+    parsed, _reason = rtn_compat.parse_release(title)
+    return quality_label_from_parsed(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -437,14 +455,22 @@ def _as_recent_failure_lookup(recent_failures) -> RecentFailureLookup:
 
 def _run_gates(candidate: Candidate, want: SelectWant, parsed,
                blocklist: BlocklistLookup,
-               cam_check: Optional[Callable[[str], bool]]):
+               cam_check: Optional[Callable[[str], bool]],
+               parse_reason: str = ""):
     """Return (passed, reason_code, detail). `parsed` is the RTN ParsedData (or
-    None if gate 1 already failed to parse)."""
+    None if gate 1 already failed to parse); `parse_reason` is rtn_compat's
+    verdict on WHY it is None."""
     identity = want.identity
 
-    # Gate 1: parse. Handled by the caller (parsed is None -> unparseable).
+    # Gate 1: parse. 'parse_error' means our parser broke (an environment bug,
+    # loud in the log); 'unparseable' means the release name carries no title.
     if parsed is None or not (getattr(parsed, "parsed_title", "") or "").strip():
-        return False, "unparseable", f"RTN could not parse {candidate.title!r}"
+        reason = parse_reason or "unparseable"
+        if reason == "parse_error":
+            return False, reason, (
+                f"the release-name parser raised on {candidate.title!r} — a "
+                f"parser/build fault, not a bad release")
+        return False, reason, f"RTN could not parse {candidate.title!r}"
 
     # Gate 2: blocklist (subject-scoped; reason-aware).
     reason = blocklist(candidate, parsed)
@@ -558,6 +584,77 @@ def _int_list(value) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# Language / resolution preference helpers (pure, title + parse only)
+# ---------------------------------------------------------------------------
+
+# An explicit English marker in the release name. RTN's `languages` already
+# reports 'en' for most of these, but plenty of scene/fansub names carry the
+# signal only as text ("Dual Audio", "Multi-Subs", "[Eng Subs]").
+_ENGLISH_MARKER_RE = re.compile(
+    r"(?<![a-z0-9])("
+    r"eng|english|"
+    r"dual[\s._-]?audio|"
+    r"multi[\s._-]?sub(s|bed)?|"
+    r"eng[\s._-]?(sub|dub)(s|bed)?|"
+    r"english[\s._-]?(sub|dub)(s|bed)?"
+    r")(?![a-z0-9])",
+    re.IGNORECASE)
+
+
+def _parsed_languages(parsed) -> set:
+    """Lowercased ISO language codes RTN found in the release name."""
+    raw = getattr(parsed, "languages", None) or ()
+    if isinstance(raw, str):
+        raw = [raw]
+    out = set()
+    try:
+        for code in raw:
+            text = str(code or "").strip().lower()
+            if text:
+                out.add(text)
+    except TypeError:
+        return set()
+    return out
+
+
+def has_english_marker(title: str, parsed=None) -> bool:
+    """True when the release name claims English audio or subtitles."""
+    if parsed is not None and "en" in _parsed_languages(parsed):
+        return True
+    return bool(_ENGLISH_MARKER_RE.search(title or ""))
+
+
+def language_score(title: str, parsed, media_type: str) -> float:
+    """The language preference component.
+
+    Movies: a foreign-language tag with no English marker is a heavy
+    non-preference. Anime/xanime: an English marker is a strong preference.
+    TV and everything else: language is not scored (release names for shows
+    are overwhelmingly English already, and tagging there is noisier).
+    """
+    languages = _parsed_languages(parsed)
+    english = has_english_marker(title, parsed)
+    if media_type in ("anime", "xanime"):
+        return _ENGLISH_ANIME_BONUS if english else 0.0
+    if media_type == "movie":
+        foreign = {code for code in languages if code != "en"}
+        if foreign and not english:
+            return _FOREIGN_LANGUAGE_PENALTY
+    return 0.0
+
+
+def resolution_score(title: str, parsed) -> float:
+    """The 4K non-preference. 2160p/UHD loses unless it is all there is."""
+    resolution = _scalar(getattr(parsed, "resolution", None)).lower()
+    if resolution in ("2160p", "4k", "uhd"):
+        return _UHD_PENALTY
+    if not resolution and re.search(r"(?<![a-z0-9])(2160p|4k|uhd)(?![a-z0-9])",
+                                    title or "", re.IGNORECASE):
+        return _UHD_PENALTY
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # The versioned score (survivors only) — plexxarr-v1 (section 4 item 3)
 # ---------------------------------------------------------------------------
 
@@ -623,6 +720,12 @@ def _score(candidate: Candidate, want: SelectWant, parsed,
     # recent_failure: -25 when this release failed for this context in-window.
     components["recent_failure"] = _RECENT_FAILURE_PENALTY if recent_failure else 0.0
 
+    # language_pref / resolution_pref: Cole's watchability rules. Both are
+    # scores, never gates — the only-copy-in-existence still gets to win.
+    components["language_pref"] = language_score(
+        candidate.title, parsed, identity.media_type)
+    components["resolution_pref"] = resolution_score(candidate.title, parsed)
+
     total = sum(components.values())
     return ScoreBreakdown(
         infohash=candidate.norm_infohash,
@@ -672,12 +775,11 @@ def select_torrent(candidates: Iterable, want: SelectWant, *,
     survivors: list[tuple[Candidate, object]] = []
 
     for cand in cands:
-        try:
-            parsed = parse(cand.title) if (cand.title or "").strip() else None
-        except Exception:
-            parsed = None
+        # parse_error (the parser itself raised) is NOT the release's fault and
+        # must never be reported as 'unparseable' — see rtn_compat.
+        parsed, parse_reason = rtn_compat.parse_release(cand.title)
         passed, reason, detail = _run_gates(cand, want, parsed, block_lookup,
-                                            cam_check)
+                                            cam_check, parse_reason=parse_reason)
         verdicts.append(GateVerdict(
             infohash=cand.norm_infohash, title=cand.title,
             passed=passed, reason_code=reason, detail=detail))

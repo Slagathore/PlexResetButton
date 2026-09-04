@@ -91,6 +91,8 @@ class QueueRequest:
     batch_id: str | None = None               # groups an "All seasons" expansion
     placed_at: str | None = None              # verified files moved to plan
     library_verified_at: str | None = None    # library index confirmed identity
+    # Schema v4 — the provider's release / first-air date, ISO "YYYY-MM-DD".
+    release_date: str | None = None
 
     @property
     def is_qualified(self) -> bool:
@@ -155,6 +157,12 @@ _V2_COLUMNS: list[tuple[str, str]] = [
     ("library_checked_at", "TEXT"),
 ]
 
+# v4: the release date, so the confirmation message can show it and auto-grab
+# can stop hammering indexers for a film that has not come out yet.
+_V4_COLUMNS: list[tuple[str, str]] = [
+    ("release_date", "TEXT"),
+]
+
 _V3_COLUMNS: list[tuple[str, str]] = [
     ("identity_source",       "TEXT"),
     ("canonical_year",        "INTEGER"),
@@ -209,7 +217,7 @@ def initialize_queue_db() -> None:
             for row in conn.execute("PRAGMA table_info(requests)").fetchall()
         }
 
-        for col_name, col_def in (_V2_COLUMNS + _V3_COLUMNS):
+        for col_name, col_def in (_V2_COLUMNS + _V3_COLUMNS + _V4_COLUMNS):
             if col_name not in existing_cols:
                 # Interpolated identifiers come from the static _V2/_V3
                 # column literals above — never feed these user-supplied
@@ -298,7 +306,7 @@ _SELECT_COLS = (
     "media_type, resolved_title, external_id, external_url, "
     "found_in_library, library_checked_at, identity_source, canonical_year, "
     "origin_countries_json, aliases_json, season, batch_id, placed_at, "
-    "library_verified_at"
+    "library_verified_at, release_date"
 )
 
 
@@ -329,6 +337,7 @@ def _row_to_request(row: sqlite3.Row) -> QueueRequest:
         batch_id=opt("batch_id"),
         placed_at=opt("placed_at"),
         library_verified_at=opt("library_verified_at"),
+        release_date=opt("release_date"),
     )
 
 
@@ -351,6 +360,7 @@ def add_request(
     aliases: list[str] | None = None,
     season: int | None = None,
     batch_id: str | None = None,
+    release_date: str | None = None,
 ) -> QueueRequest:
     """
     Add a new request to the queue.
@@ -367,6 +377,7 @@ def add_request(
         identity_source: provider token (tmdb|tvdb|jikan|anidb|anilist|omdb).
         canonical_year / origin_countries / aliases / season / batch_id:
             v3 identity + season-targeting fields.
+        release_date: provider release / first-air date, ISO "YYYY-MM-DD".
     """
     clean_content = " ".join(content.split())
     clean_requester = " ".join(requester.split()) or "Unknown"
@@ -383,12 +394,13 @@ def add_request(
             INSERT INTO requests
                 (requester, content, status, media_type, resolved_title,
                  external_id, external_url, identity_source, canonical_year,
-                 origin_countries_json, aliases_json, season, batch_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 origin_countries_json, aliases_json, season, batch_id,
+                 release_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (clean_requester, clean_content, status, media_type, resolved_title,
              external_id, external_url, identity_source, canonical_year,
-             countries_json, aliases_json, season, batch_id),
+             countries_json, aliases_json, season, batch_id, release_date),
         )
         conn.commit()
         if cursor.lastrowid is None:
@@ -469,6 +481,7 @@ def update_identity(
     origin_countries: list[str] | None = None,
     aliases: list[str] | None = None,
     season: int | None = None,
+    release_date: str | None = None,
 ) -> QueueRequest | None:
     """Attach a resolved provider identity to an existing row (the resolve path
     for needs_identity rows). Flips the row to 'open' (auto-grabbable) only when
@@ -485,15 +498,27 @@ def update_identity(
             SET media_type = ?, resolved_title = ?, external_id = ?,
                 external_url = ?, identity_source = ?, canonical_year = ?,
                 origin_countries_json = ?, aliases_json = ?, season = ?,
-                status = ?
+                status = ?, release_date = COALESCE(?, release_date)
             WHERE id = ?
             """,
             (media_type, resolved_title, external_id, external_url,
              identity_source, canonical_year, countries_json, aliases_json,
-             season, new_status, request_id),
+             season, new_status, release_date, request_id),
         )
         conn.commit()
     return get_request(request_id)
+
+
+def set_release_date(request_id: int, release_date: str | None) -> None:
+    """Store the provider release date on an existing row (the backfill path
+    for requests created before the column existed)."""
+    if not release_date:
+        return
+    initialize_queue_db()
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        conn.execute("UPDATE requests SET release_date = ? WHERE id = ?",
+                     (release_date[:10], request_id))
+        conn.commit()
 
 
 def set_status(request_id: int, status: str) -> None:

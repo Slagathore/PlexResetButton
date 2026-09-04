@@ -14,6 +14,16 @@
 #
 # Every source degrades gracefully to [] on failure (same pattern as
 # media_lookup.py) — a dead mirror should never break the tab.
+#
+# Query handling (see the "Query shaping" section): indexer search engines are
+# dumber than they look. apibay tokenizes on punctuation and, when a query
+# matches nothing, answers with its TRENDING list instead of an empty array —
+# so "C.H.U.D." came back as 100 unrelated blockbusters, and every caller that
+# treated "the pool is non-empty" as "the query worked" happily gated the whole
+# junk list and gave up. Everything a query touches is therefore shaped here:
+# punctuation-stripped and acronym-collapsed spellings, a distinctive-word
+# fallback, an optional translation for native-script titles, and a relevance
+# filter that throws the trending list away instead of believing it.
 # =============================================================================
 
 import json
@@ -124,6 +134,200 @@ def _infohash(magnet: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Query shaping — spellings, relevance, and the fallback ladder
+# ---------------------------------------------------------------------------
+# Nothing in here talks to the network. It decides WHAT to ask for and WHICH
+# answers are plausibly about the thing we asked for.
+
+# Words too common to prove a result is on-topic.
+_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "of", "in", "on", "at", "to", "for", "is", "it",
+    "with", "from", "part", "season", "series", "complete", "episode", "vol",
+    "volume", "movie", "film", "show", "tv", "hd", "us", "uk",
+})
+
+# Tokens that qualify a search rather than name it: S01, S01E02, E05, EP12,
+# a 4-digit year, "1080p"-style resolutions. Preserved verbatim by every
+# rewrite, because "Scooby S01" must not degrade into plain "Scooby".
+_MARKER_RE = re.compile(
+    r"^(?:s\d{1,3}(?:e\d{1,4})?|e\d{1,4}|ep\d{1,4}|\d{4}|\d{3,4}p)$",
+    re.IGNORECASE)
+
+# How many spellings one search is allowed to try (see query_variants).
+_MAX_VARIANTS = 3
+
+# A dotted acronym: C.H.U.D. / S.W.A.T. / R.I.P.D. Indexer search engines split
+# on the dots and match nothing, so these must be collapsed to CHUD / SWAT.
+_ACRONYM_RE = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]\.){2,}", re.IGNORECASE)
+
+# Grammar artifacts nobody puts in a release name. Apostrophes vanish
+# ("What's" -> "Whats"); everything else becomes a space.
+_APOSTROPHES = "'\u2019\u02bc\u00b4`"
+# Unicode-aware on purpose: a CJK title must survive punctuation stripping
+# intact, or "逐玉 S01" degrades into a bare "S01" that matches the world.
+_PUNCT_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def collapse_acronyms(text: str) -> str:
+    """'C.H.U.D. (1984)' -> 'CHUD (1984)'."""
+    def _join(match: "re.Match[str]") -> str:
+        return match.group(0).replace(".", "")
+    return _ACRONYM_RE.sub(_join, text or "")
+
+
+def strip_grammar(text: str) -> str:
+    """Punctuation-free spelling: apostrophes deleted, other punctuation to
+    spaces. "What's New Scooby-Doo?" -> "Whats New Scooby Doo"."""
+    text = collapse_acronyms(text or "")
+    for mark in _APOSTROPHES:
+        text = text.replace(mark, "")
+    return " ".join(_PUNCT_RE.sub(" ", text).split())
+
+
+def compact(text: str) -> str:
+    """Lowercase, word characters only — the shape used to compare a result
+    title against a query without punctuation getting a vote."""
+    return re.sub(r"[^\w]+", "", (text or "").casefold(), flags=re.UNICODE)
+
+
+def _split_markers(query: str) -> tuple[str, str]:
+    """Split 'Whats New Scooby Doo S01' into ('Whats New Scooby Doo', 'S01')."""
+    words = strip_grammar(query).split()
+    head: list[str] = []
+    tail: list[str] = []
+    for word in words:
+        if _MARKER_RE.match(word):
+            tail.append(word)
+        elif tail:
+            tail.append(word)   # anything after a marker stays with it
+        else:
+            head.append(word)
+    return " ".join(head), " ".join(tail)
+
+
+def distinctive_word(query: str) -> str:
+    """The single most identifying word in a title, or '' when there isn't one.
+
+    Release groups rename things stupidly ("What's New, Scooby-Doo?" is filed
+    a dozen different ways) but they almost always keep the one weird word.
+    Searching that word alone and letting the caller's own matching sort it
+    out finds releases no faithful spelling ever will.
+    """
+    head, _tail = _split_markers(query)
+    words = [w for w in head.split() if w.casefold() not in _STOPWORDS]
+    if not words:
+        return ""
+    best = max(words, key=lambda w: (len(w), w.casefold()))
+    return best if len(best) >= 4 else ""
+
+
+def _has_latin_letters(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text or ""))
+
+
+def translate_query(query: str) -> str:
+    """English spelling of a native-script title, or '' when unavailable.
+
+    A Chinese/Japanese/Korean title searched verbatim finds nothing on trackers
+    that index English release names, while the translated title ("逐玉" ->
+    "Pursuit of Jade") has whole seasons sitting there. Best effort: the LLM is
+    optional and a failure just means one fewer variant to try.
+    """
+    # Judge the TITLE, not the markers: "逐玉 S01" is still a native-script
+    # title even though "S01" is Latin.
+    head, _tail = _split_markers(query)
+    if not head.strip() or _has_latin_letters(head):
+        return ""
+    query = head
+    try:
+        import llm_service
+        english = llm_service.translate_title_to_english(query)
+    except Exception:
+        logger.debug("Title translation unavailable for %r.", query, exc_info=True)
+        return ""
+    english = (english or "").strip()
+    return english if english and _has_latin_letters(english) else ""
+
+
+def query_variants(query: str) -> tuple[str, ...]:
+    """Spellings to try, in order, until one answers with relevant results.
+
+    1. exactly what the caller asked for
+    2. the same thing with the grammar removed (apostrophes, dots, dashes)
+    3. the distinctive word alone, keeping any S01/year marker
+    4. an English translation, for native-script titles only
+    """
+    query = " ".join((query or "").split())
+    if not query:
+        return tuple()
+
+    variants = [query]
+
+    def _add(candidate: str) -> None:
+        candidate = " ".join((candidate or "").split())
+        if candidate and not any(
+                candidate.casefold() == existing.casefold() for existing in variants):
+            variants.append(candidate)
+
+    _add(strip_grammar(query))
+
+    head, tail = _split_markers(query)
+    word = distinctive_word(query)
+    if word and word.casefold() != head.casefold():
+        _add(f"{word} {tail}".strip())
+
+    english = translate_query(query)
+    if english:
+        _add(english)
+        _add(f"{english} {tail}".strip())
+
+    # Bounded on purpose: every extra spelling is another provider request, and
+    # the auto-grab pass already walks its own alias variants on top of these.
+    # Three attempts is enough to cover "as typed", "without the grammar" and
+    # "the one weird word" without turning one search into a burst.
+    return tuple(variants[:_MAX_VARIANTS])
+
+
+def is_relevant(title: str, query: str) -> bool:
+    """Could this result plausibly be what the query asked for?
+
+    True when the result title contains any distinctive query token (compared
+    punctuation-free, so "C.H.U.D." matches "CHUD" and vice versa). Markers
+    alone never qualify — 'S01' matching is not evidence of anything.
+
+    This exists because apibay answers a query it cannot match with its
+    TRENDING list rather than an empty array. Without this filter a search for
+    an obscure 1984 horror film returns the week's blockbusters, callers see a
+    full pool and stop looking, and every one of those results then burns a
+    rejection in the selection log.
+    """
+    head, _tail = _split_markers(query)
+    tokens = [w for w in head.split() if w.casefold() not in _STOPWORDS]
+    if not tokens:
+        tokens = head.split()
+    if not tokens:
+        return True     # nothing to judge against; don't invent a verdict
+
+    haystack = compact(title)
+    if not haystack:
+        return False
+    # The whole punctuation-free title is the strongest signal; single tokens
+    # are the fallback so renamed/reordered releases still qualify.
+    if compact(head) and compact(head) in haystack:
+        return True
+    return any(compact(token) in haystack for token in tokens if len(token) >= 3)
+
+
+def filter_relevant(results: list["TorrentResult"], query: str) -> list["TorrentResult"]:
+    """Drop results that cannot be about `query` (see is_relevant)."""
+    kept = [r for r in results if is_relevant(r.title, query)]
+    dropped = len(results) - len(kept)
+    if dropped:
+        logger.debug("Dropped %d irrelevant result(s) for %r.", dropped, query)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # YTS — movies (JSON API)
 # ---------------------------------------------------------------------------
 
@@ -167,14 +371,35 @@ def search_yts(query: str, *, limit: int = 20) -> list[TorrentResult]:
 # The Pirate Bay — via the apibay.org JSON API (no HTML scraping)
 # ---------------------------------------------------------------------------
 
-def search_tpb(query: str, media_type: str, *, limit: int = 30,
-               collect: bool = False) -> list[TorrentResult]:
-    if not _provider_available("tpb"):
-        logger.debug("TPB circuit open; skipping search for %r.", query)
-        return []
-    # cat=200 restricts to Video. (Categories: 201 movies, 205 TV, 207 HD
-    # movies, 208 HD TV — 200 covers the whole video tree.)
-    url = "https://apibay.org/q.php?" + urllib.parse.urlencode({"q": query, "cat": "200"})
+# TPB category ids. Searching the specific categories a media type actually
+# lives in beats the whole-video tree (cat=200): apibay caps a response at 100
+# rows, so a broad search spends that budget on music videos and 3D rips before
+# it reaches the film you asked for. Movies get plain Movies, HD Movies and
+# Movies-DVDR; shows get TV and HD TV. 4K is not a category — it is scored
+# against in torrent_select, so a 2160p-only title is still findable.
+_TPB_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "movie": ("201", "207", "202"),   # Movies, HD Movies, Movies DVDR
+    "tv": ("205", "208"),             # TV shows, HD TV shows
+    "anime": ("205", "208", "201", "207"),
+    "xanime": ("205", "208", "201", "207"),
+}
+# Everything else (media_type "other"/"unknown") keeps the whole video tree.
+_TPB_DEFAULT_CATEGORIES = ("200",)
+
+# apibay never returns more than this many rows per request; hitting it means
+# the answer was truncated and per-category requests are worth the extra calls.
+_TPB_PAGE_CAP = 100
+
+
+def tpb_categories(media_type: str) -> tuple[str, ...]:
+    """The TPB category ids to search for a media type."""
+    return _TPB_CATEGORIES.get(media_type, _TPB_DEFAULT_CATEGORIES)
+
+
+def _tpb_request(query: str, cat: str, media_type: str) -> list[TorrentResult]:
+    """One apibay call. Returns [] on failure (and trips the circuit)."""
+    url = "https://apibay.org/q.php?" + urllib.parse.urlencode(
+        {"q": query, "cat": cat})
     try:
         payload = json.loads(_http_get(url))
     except Exception as exc:
@@ -197,6 +422,37 @@ def search_tpb(query: str, media_type: str, *, limit: int = 30,
             source="tpb",
             media_type=media_type,
         ))
+    return results
+
+
+def search_tpb(query: str, media_type: str, *, limit: int = 30,
+               collect: bool = False) -> list[TorrentResult]:
+    if not _provider_available("tpb"):
+        logger.debug("TPB circuit open; skipping search for %r.", query)
+        return []
+
+    categories = tpb_categories(media_type)
+    # One combined request first (apibay accepts a comma-separated list); only
+    # when it comes back capped is the answer truncated enough to be worth
+    # asking each category separately.
+    results = _tpb_request(query, ",".join(categories), media_type)
+    if len(results) >= _TPB_PAGE_CAP and len(categories) > 1:
+        seen = {_infohash(r.magnet) for r in results}
+        for cat in categories:
+            for extra in _tpb_request(query, cat, media_type):
+                ih = _infohash(extra.magnet)
+                if ih and ih in seen:
+                    continue
+                seen.add(ih)
+                results.append(extra)
+
+    if not results and categories != _TPB_DEFAULT_CATEGORIES:
+        # Uploaders miscategorise constantly. Narrowing the search must make
+        # the good results easier to find, never make a findable release
+        # unfindable, so an empty answer falls back to the whole video tree.
+        results = _tpb_request(query, ",".join(_TPB_DEFAULT_CATEGORIES),
+                               media_type)
+
     # Collection mode keeps the API's own order and only BOUNDS the pool — it
     # must not seeder-sort-then-truncate, or a correct low-seed release gets
     # dropped before the gates ever run (section 4 item 1).
@@ -280,25 +536,122 @@ def search_sukebei(query: str, *, limit: int = 30,
 # Unified entry point
 # ---------------------------------------------------------------------------
 
-def search_torrents(query: str, media_type: str, *, limit: int = 30) -> list[TorrentResult]:
-    """Search the right source(s) for the media type, best-seeded first."""
-    query = query.strip()
-    if not query:
-        return []
-
+def _search_one(query: str, media_type: str, *, limit: int,
+                collect: bool) -> list[TorrentResult]:
+    """Every source for a media type, for exactly one spelling of the query."""
     results: list[TorrentResult] = []
     if media_type == "movie":
         results.extend(search_yts(query, limit=limit))
-        results.extend(search_tpb(query, media_type, limit=limit))
+        results.extend(search_tpb(query, media_type, limit=limit, collect=collect))
     elif media_type == "anime":
-        results.extend(search_nyaa(query, limit=limit))
+        results.extend(search_nyaa(query, limit=limit, collect=collect))
     elif media_type == "xanime":
-        results.extend(search_sukebei(query, limit=limit))
+        results.extend(search_sukebei(query, limit=limit, collect=collect))
     else:  # tv / other / unknown
-        results.extend(search_tpb(query, media_type, limit=limit))
+        results.extend(search_tpb(query, media_type, limit=limit, collect=collect))
+    return results
 
-    results.sort(key=lambda r: r.seeders, reverse=True)
-    return results[:limit]
+
+# A pool worth stopping on: something is actually seeded, and there is enough
+# of it to choose between. Anything thinner and the ladder keeps climbing —
+# one dead 0-seeder result is "nothing download-worthy", not a search hit.
+_ENOUGH_RESULTS = 3
+
+
+def _pool_is_solid(results: list[TorrentResult]) -> bool:
+    distinct = {_infohash(r.magnet) or r.title.casefold() for r in results}
+    return (len(distinct) >= _ENOUGH_RESULTS
+            and any(r.seeders > 0 for r in results))
+
+
+def _ladder(query: str, media_type: str, *, per_source: int, collect: bool,
+            fetch) -> tuple[list[tuple[str, list[TorrentResult]]],
+                            list[str], tuple[str, ...]]:
+    """Walk the spelling ladder, merging until the pool is worth stopping on.
+
+    `fetch(variant)` returns [(source, results), ...] for one spelling. Every
+    spelling's results are relevance-filtered before they count, so apibay's
+    trending-list answer to an unmatched query can never masquerade as a hit.
+
+    Returns (per_source_results, queries_that_contributed, queries_tried).
+    """
+    variants = query_variants(query)
+    per_source_totals: dict[str, list[TorrentResult]] = {}
+    contributed: list[str] = []
+    tried: list[str] = []
+    seen: set[str] = set()
+
+    for variant in variants:
+        tried.append(variant)
+        # Relevance is judged against the ORIGINAL request for the faithful
+        # spelling and against the rewrite for the rest — a distinctive-word
+        # search is supposed to return more than the exact phrase.
+        against = query if variant == variants[0] else variant
+        got_any = False
+        for source, results in fetch(variant):
+            kept = filter_relevant(results, against)
+            # Duplicates are NOT dropped here — search_collect's own dedupe
+            # keeps the healthier copy of an identical payload and reports how
+            # many it merged. `seen` only answers "did this spelling add
+            # anything new", which is what decides whether to keep climbing.
+            fresh = [r for r in kept
+                     if (_infohash(r.magnet) or r.title.casefold()) not in seen]
+            seen.update(_infohash(r.magnet) or r.title.casefold() for r in kept)
+            per_source_totals.setdefault(source, []).extend(kept)
+            got_any = got_any or bool(fresh)
+        if got_any:
+            contributed.append(variant)
+            if variant != variants[0]:
+                logger.info("Search for %r was thin; %r added results.",
+                            query, variant)
+        combined = [r for results in per_source_totals.values() for r in results]
+        if _pool_is_solid(combined):
+            break
+
+    return list(per_source_totals.items()), contributed, tuple(tried)
+
+
+def search_with_variants(query: str, media_type: str, *, limit: int = 30,
+                         collect: bool = False
+                         ) -> tuple[list[TorrentResult], str, tuple[str, ...]]:
+    """Walk the spelling ladder and return (results, query_used, queries_tried).
+
+    Results are always relevance-filtered, so "the pool is non-empty" finally
+    means what callers have always assumed it means.
+    """
+    def fetch(variant: str):
+        return [("all", _search_one(variant, media_type, limit=limit,
+                                    collect=collect))]
+
+    per_source, contributed, tried = _ladder(
+        query, media_type, per_source=limit, collect=collect, fetch=fetch)
+    results = [r for _src, batch in per_source for r in batch]
+    used = ", ".join(contributed) if contributed else (tried[0] if tried else "")
+    return results, used, tried
+
+
+def search_torrents(query: str, media_type: str, *, limit: int = 30) -> list[TorrentResult]:
+    """Search the right source(s) for the media type, best-seeded first."""
+    return search_torrents_detail(query, media_type, limit=limit)[0]
+
+
+def search_torrents_detail(query: str, media_type: str, *, limit: int = 30
+                           ) -> tuple[list[TorrentResult], str]:
+    """search_torrents plus the spelling that actually found the results, so
+    the UI can say a search for "C.H.U.D." was answered by "CHUD"."""
+    query = query.strip()
+    if not query:
+        return [], ""
+
+    results, used, _tried = search_with_variants(query, media_type, limit=limit)
+    # One row per payload, keeping the copy reporting the healthier swarm.
+    best: dict[str, TorrentResult] = {}
+    for result in results:
+        key = _infohash(result.magnet) or result.title.casefold()
+        if key not in best or result.seeders > best[key].seeders:
+            best[key] = result
+    unique = sorted(best.values(), key=lambda r: r.seeders, reverse=True)
+    return unique[:limit], used
 
 
 # ---------------------------------------------------------------------------
@@ -332,20 +685,24 @@ def search_collect(query: str, media_type: str, *,
                              pool_stats={"per_source": {}, "collected": 0,
                                          "deduped": 0, "duplicates_removed": 0})
 
-    per_source_results: list[tuple[str, list[TorrentResult]]] = []
-    if media_type == "movie":
-        per_source_results.append(("yts", search_yts(query, limit=per_source)))
-        per_source_results.append(
-            ("tpb", search_tpb(query, media_type, limit=per_source, collect=True)))
-    elif media_type == "anime":
-        per_source_results.append(
-            ("nyaa", search_nyaa(query, limit=per_source, collect=True)))
-    elif media_type == "xanime":
-        per_source_results.append(
-            ("sukebei", search_sukebei(query, limit=per_source, collect=True)))
-    else:  # tv / other / unknown
-        per_source_results.append(
-            ("tpb", search_tpb(query, media_type, limit=per_source, collect=True)))
+    # The spelling ladder runs here, so every automatic caller gets the
+    # punctuation-free / distinctive-word / translated retries for free.
+    def fetch(variant: str):
+        if media_type == "movie":
+            return [("yts", search_yts(variant, limit=per_source)),
+                    ("tpb", search_tpb(variant, media_type,
+                                       limit=per_source, collect=True))]
+        if media_type == "anime":
+            return [("nyaa", search_nyaa(variant, limit=per_source, collect=True))]
+        if media_type == "xanime":
+            return [("sukebei", search_sukebei(variant, limit=per_source,
+                                               collect=True))]
+        return [("tpb", search_tpb(variant, media_type,
+                                   limit=per_source, collect=True))]
+
+    per_source_results, contributed, variants_tried = _ladder(
+        query, media_type, per_source=per_source, collect=True, fetch=fetch)
+    used_query = ", ".join(contributed) if contributed else query
 
     per_source_stats: dict = {}
     collected: list[TorrentResult] = []
@@ -375,6 +732,9 @@ def search_collect(query: str, media_type: str, *,
         "collected": len(collected),
         "deduped": len(deduped),
         "duplicates_removed": len(collected) - len(deduped),
+        # Which spelling actually answered, and everything tried on the way.
+        "query_used": used_query,
+        "query_variants_tried": list(variants_tried),
     }
     return CollectedPool(results=tuple(deduped), pool_stats=stats)
 

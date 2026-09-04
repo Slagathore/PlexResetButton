@@ -18,6 +18,7 @@
 #   - Every rename/move writes a before/after history row.
 # =============================================================================
 
+import datetime as _dt
 import json
 import logging
 import re
@@ -35,6 +36,7 @@ from typing import Any, Callable
 
 import config
 import downloads_store
+import presence_ledger
 import media_identity
 import media_quality
 import queue_store
@@ -354,6 +356,69 @@ def _auto_grab_query(req, *, season: int | None = None) -> str:
         if year:
             return f"{alias} {year}"
     return alias
+
+
+def _release_date_of(req) -> "_dt.date | None":
+    """The request's stored release date as a date, or None if unusable."""
+    raw = str(getattr(req, "release_date", "") or "")[:10]
+    if len(raw) != 10:
+        return None
+    try:
+        year, month, day = (int(part) for part in raw.split("-"))
+        return _dt.date(year, month, day)
+    except (ValueError, TypeError):
+        return None
+
+
+def prerelease_hold_hours(req, *, today: "_dt.date | None" = None,
+                          lead_days: int | None = None) -> float:
+    """Hours to wait before searching for a movie that is not out yet.
+
+    0.0 means "search now". A film released in the future is not on any
+    tracker, so every pass spent looking for it is wasted provider budget and
+    a pile of empty selection runs. Searching resumes `lead_days` before the
+    release date, because decent pre-release web rips and screeners do appear
+    in that window.
+
+    Only movies are held: a TV request targets a season whose episodes air
+    over time, and the show tracker already paces those per episode.
+    """
+    if getattr(req, "media_type", None) != "movie":
+        return 0.0
+    lead = config.MOVIE_PRERELEASE_LEAD_DAYS if lead_days is None else lead_days
+    if lead <= 0:
+        return 0.0
+    release = _release_date_of(req)
+    if release is None:
+        return 0.0
+    today = today or _dt.date.today()
+    days_early = (release - today).days - lead
+    return max(0.0, days_early * 24.0)
+
+
+def _with_release_date(req):
+    """The request, with its release date filled in if it was missing.
+
+    Rows created before the column existed carry no date, so the pre-release
+    hold would never apply to the queue Cole already has. One lookup per row,
+    cached in media_lookup and then persisted, so this is not a per-pass cost.
+    Any failure just leaves the row as it was.
+    """
+    if getattr(req, "release_date", None) or getattr(req, "media_type", None) != "movie":
+        return req
+    if getattr(req, "identity_source", None) != "tmdb" or not req.external_id:
+        return req
+    try:
+        import media_lookup
+        found = media_lookup.get_tmdb_release_date(req.external_id, "movie")
+        if not found:
+            return req
+        queue_store.set_release_date(req.request_id, found)
+        return queue_store.get_request(req.request_id) or req
+    except Exception:
+        logger.debug("Release-date backfill failed for request #%s",
+                     getattr(req, "request_id", "?"), exc_info=True)
+        return req
 
 
 def _search_title_variants(title: str) -> tuple[str, ...]:
@@ -859,6 +924,32 @@ class DownloadManager:
             result, req, request_title=request_title,
             show_id=show_id, season=season, episode=episode, minutes=minutes,
             identity=identity_override)
+
+        # The same info-hash is the same bytes. A second row for it splits an
+        # already-thin swarm and lands the file twice, so adopt the download
+        # that is already fetching it and hang this request's bookkeeping off
+        # that one instead. (A manual Gulliver's Travels grab and the request's
+        # own auto-grab both sat at 0.7% for ten hours doing exactly this.)
+        existing = presence_ledger.live_download_for(result.magnet)
+        if existing is not None:
+            logger.info(
+                "Grab: download #%s is already fetching %s — linking to it "
+                "instead of starting a second copy.",
+                existing.download_id, result.title)
+            if request_id is not None:
+                role = ("episode" if episode is not None
+                        else "season_pack" if season is not None else "movie")
+                downloads_store.link_request_download(
+                    request_id, existing.download_id, role)
+                if req is not None and req.status in (
+                        queue_store.STATUS_OPEN, queue_store.STATUS_DEFERRED):
+                    queue_store.set_status(request_id,
+                                           queue_store.STATUS_GRABBING)
+            if episode_context is not None:
+                shows_store.set_episode_grab(
+                    episode_context[0], episode_context[1], episode_context[2],
+                    existing.download_id)
+            return existing.download_id
 
         download_id = downloads_store.create_download(
             title=result.title, magnet=result.magnet, source=result.source,
@@ -1526,6 +1617,32 @@ class DownloadManager:
     # (RTN.title_match + sequel/numeric guards) supersedes the old
     # containment/fuzzy check. Nothing else referenced it.
 
+    def _show_for_download(self, row) -> shows_store.TrackedShow | None:
+        """The tracked show a placed download belongs to, for rows that never
+        carried show context (a manual grab, a legacy row).
+
+        Identity first — the want snapshot froze the provider id at grab time —
+        then the linked request, then a fuzzy title match as the last resort.
+        """
+        want = {}
+        try:
+            want = json.loads(row.want_json) if row.want_json else {}
+        except (ValueError, TypeError):
+            want = {}
+        source = want.get("identity_source")
+        ext = want.get("external_id")
+        if source and ext:
+            show = shows_store.get_show_by_identity(str(source), str(ext))
+            if show is not None:
+                return show
+        if row.request_id is not None:
+            show = self._tracked_show_for_request(get_request(row.request_id))
+            if show is not None:
+                return show
+        parsed = torrent_routing.parse_torrent_name(row.title)
+        title = parsed.show_title or want.get("canonical_title") or row.title
+        return self._match_tracked_show(title)
+
     def _match_tracked_show(self, title: str) -> shows_store.TrackedShow | None:
         best: shows_store.TrackedShow | None = None
         best_score = 0.0
@@ -1820,7 +1937,11 @@ class DownloadManager:
     def _on_download_placed(self, row: downloads_store.DownloadRow,
                             moved_final_paths: list[str]) -> None:
         """A download's verified files are in place. Link provenance and let the
-        AGGREGATE decide whether the REQUEST is fulfilled (item 4)."""
+        AGGREGATE decide whether the REQUEST is fulfilled (item 4).
+
+        Presence registration happens in _post_process, BEFORE this, and
+        happens whether or not a request is attached — a request is needed to
+        settle a request, never to record what is on disk."""
         if row.request_id is None:
             return
         if row.season is not None and row.episode is None:
@@ -1840,6 +1961,47 @@ class DownloadManager:
                              row.download_id)
         queue_store.set_status(row.request_id, queue_store.STATUS_PLACED)
         self._finalize_fulfillment(row.request_id)
+
+    def _settle_requests_for_show(self, show_id: int | None,
+                                  season: int | None) -> None:
+        """Re-check every live request that wants this show/season.
+
+        A download settles the request it was started for; this settles the
+        ones it merely SATISFIED. Widow's Bay S01 landed from a manual grab
+        with no request attached, so request #154 sat in 'grabbing' and kept
+        re-queueing a season it already had.
+        """
+        if show_id is None:
+            return
+        live = (queue_store.STATUS_OPEN, queue_store.STATUS_GRABBING,
+                queue_store.STATUS_DEFERRED, queue_store.STATUS_PLACED,
+                queue_store.STATUS_VERIFYING)
+        try:
+            candidates = list_requests(status="active", limit=500)
+        except Exception:
+            logger.exception("Could not list requests to settle after a placement.")
+            return
+        for req in candidates:
+            if req.status not in live:
+                continue
+            if req.media_type not in ("tv", "anime", "xanime"):
+                continue
+            if season is not None and req.season is not None and req.season != season:
+                continue
+            show = self._tracked_show_for_request(req)
+            if show is None or show.show_id != show_id:
+                continue
+            before = req.status
+            try:
+                self._finalize_fulfillment(req.request_id)
+            except Exception:
+                logger.exception("Could not settle request #%s after a placement.",
+                                 req.request_id)
+                continue
+            after = get_request(req.request_id)
+            if after is not None and after.status != before:
+                logger.info("Request #%s settled to '%s' by a placement it was "
+                            "not linked to.", req.request_id, after.status)
 
     def _finalize_fulfillment(self, request_id: int) -> None:
         """AGGREGATE fulfillment (Task C item 4): moved_any is dead. A movie /
@@ -2253,7 +2415,16 @@ class DownloadManager:
             # duplicate work already completed or in flight.
             has_progress = any(e.has_file or e.grab_download_id is not None
                                for e in aired)
-            if not has_progress:
+            # A pack already downloading for this season IS progress, even
+            # though it leaves no per-episode trace.
+            live_pack = self._season_pack_in_flight(
+                req.request_id, getattr(show, "show_id", None), season)
+            if live_pack is not None:
+                logger.info(
+                    "Request #%s: season %s pack is already in flight as "
+                    "download #%s; not grabbing another.",
+                    req.request_id, season, live_pack)
+            if not has_progress and live_pack is None:
                 packed = self._grab_season_pack(
                     display, req.media_type, season,
                     len(aired) or len(season_eps) or 12,
@@ -2335,6 +2506,48 @@ class DownloadManager:
         return self._grab_season_pack(show.title, show.media_type, target,
                                       ep_count, request_id=req.request_id, show=show,
                                       search_title=title)
+
+    @staticmethod
+    def _season_pack_in_flight(request_id: int | None, show_id: int | None,
+                               season: int | None) -> int | None:
+        """The id of a season-pack download already working on this season.
+
+        A pack grab records NOTHING per episode (the pack carries many files,
+        named at move time), so the caller's per-episode "has_progress" check
+        cannot see one. Without this, every five-minute pass re-grabbed the
+        same pack: request 154 (Widow's Bay S01) queued 32 identical copies of
+        one release in two hours. An episode grab has `ep.grab_download_id` to
+        answer this question; a pack has only the downloads row.
+
+        Terminal-failure rows (error/cancelled) deliberately do NOT count, so a
+        pack that died still lets the next pass try a different release.
+        """
+        if season is None:
+            return None
+        rows = []
+        try:
+            if request_id is not None:
+                rows.extend(downloads_store.downloads_for_request(
+                    request_id, include_removed=False))
+            if show_id is not None:
+                rows.extend(downloads_store.list_downloads_by_status(
+                    ("queued", "downloading", "seeding", "verifying",
+                     "completed", "moved")))
+        except Exception:
+            logger.exception("Season-pack in-flight check failed for show %s "
+                             "season %s", show_id, season)
+            return None
+        for row in rows:
+            if getattr(row, "season", None) != season:
+                continue
+            if show_id is not None and getattr(row, "show_id", None) != show_id:
+                continue
+            if getattr(row, "episode", None) is not None:
+                continue        # an episode grab, not a pack
+            if getattr(row, "status", "") in ("error", "cancelled"):
+                continue
+            return getattr(row, "download_id", None) or getattr(row, "id", None)
+        return None
 
     def _grab_one_episode(self, show: shows_store.TrackedShow,
                           ep: shows_store.EpisodeRow,
@@ -2568,11 +2781,28 @@ class DownloadManager:
             # open row later in the list is skipped even if this one grabs nothing.
             if ident_key:
                 grabbed_identities.add(ident_key)
+            request_deferral_key = f"req:{req.request_id}"
+            # Not out yet? Sit on it until the pre-release window opens
+            # instead of searching for a film that does not exist.
+            req = _with_release_date(req)
+            hold_hours = prerelease_hold_hours(req)
+            if hold_hours > 0:
+                downloads_store.set_grab_deferral(
+                    request_deferral_key, wait_hours=hold_hours,
+                    reason=(f"not released yet, out {req.release_date}; "
+                            f"searching starts "
+                            f"{config.MOVIE_PRERELEASE_LEAD_DAYS} days before"))
+                logger.info(
+                    "Request #%s (%s) is not out until %s — holding the search "
+                    "for %.0f day(s).", req.request_id,
+                    req.resolved_title or req.content, req.release_date,
+                    hold_hours / 24.0)
+                continue
+
             # Query from the stored identity (search alias + canonical year for
             # movies), never raw user text or a native-script canonical title.
             query = _auto_grab_query(req)
             media_type = req.media_type if req.media_type != "unknown" else "other"
-            request_deferral_key = f"req:{req.request_id}"
             if self._deferral_active(request_deferral_key):
                 continue
 
@@ -3884,9 +4114,13 @@ class DownloadManager:
                             download_id, "error", before=str(old),
                             after=f"could not delete replaced file: {exc}",
                         )
-            # Close the loop for tracked episodes: mark it on-disk right away
-            # instead of waiting for the next full sync.
+            # Close the loop on the master list: whatever just landed is on
+            # disk NOW, so record it, cancel whatever that made pointless, and
+            # settle any request it finished — in that order, and for EVERY
+            # placement, not just the ones that happened to carry context.
             if row.show_id is not None and row.season is not None and row.episode is not None:
+                # A single tracked episode: the moved path is authoritative
+                # even when no per-file row exists.
                 moved_video = next(
                     (h.after_value for h in downloads_store.list_history(limit=20)
                      if h.download_id == download_id and h.action == "moved"
@@ -3894,18 +4128,41 @@ class DownloadManager:
                     str(dest_dir),
                 ) or str(dest_dir)
                 shows_store.set_episode_file(row.show_id, row.season, row.episode, moved_video)
-            elif row.show_id is not None and row.season is not None:
-                # Season pack (episode None): record EACH placed episode from its
-                # per-file provenance, and map the show folder so later seasons
-                # land beside it (Task D — closes the tracking loop for packs).
-                if plan.show_folder:
-                    shows_store.add_show_folder(row.show_id, plan.show_folder)
-                for f in downloads_store.list_download_files(download_id):
-                    if (f.verification_state in ("verified", "duplicate")
-                            and f.parsed_episode is not None and f.final_path):
-                        shows_store.set_episode_file(
-                            row.show_id, row.season, int(f.parsed_episode),
-                            f.final_path)
+            if row.show_id is not None and plan.show_folder:
+                shows_store.add_show_folder(row.show_id, plan.show_folder)
+            # Register from the PLACED FILES. A pack grabbed by hand carries
+            # neither show_id nor request_id and used to register nothing, so
+            # the grid stayed empty and the grabber kept re-fetching a season
+            # already sitting on disk (the Widow's Bay loop).
+            registration = presence_ledger.register_download(
+                row, resolve_show=self._show_for_download)
+            if (registration.show_id is not None and plan.show_folder
+                    and row.show_id is None):
+                shows_store.add_show_folder(registration.show_id,
+                                            plan.show_folder)
+            if registration.episodes and registration.show_id is None:
+                logger.warning(
+                    "Download #%s placed %d episode file(s) but no tracked "
+                    "show could be resolved — presence not recorded.",
+                    download_id, len(registration.episodes))
+            if row.episode is not None and registration.show_id is None:
+                # Single-episode grab with show context: reap against what the
+                # row itself declares, since its file rows may be sparse.
+                registration = presence_ledger.Registration(
+                    download_id=download_id, show_id=row.show_id,
+                    season=row.season, episodes=(int(row.episode),),
+                    detail="single episode")
+            # Anything still being fetched that this placement just made
+            # pointless is cancelled off the main thread.
+            threading.Thread(
+                target=presence_ledger.reap_redundant,
+                args=(row, registration),
+                name=f"reap-{download_id}", daemon=True).start()
+            # A placement can finish a request it was never linked to — a
+            # hand-grabbed pack completing the season someone asked for.
+            # Settle those too, or the request keeps grabbing what it has.
+            self._settle_requests_for_show(registration.show_id,
+                                           registration.season)
             # Task F: persist this release's quality label onto the QUALIFIED
             # identity for every verified placed file — the label now rides
             # the identity, not the filename, and survives later renames.
